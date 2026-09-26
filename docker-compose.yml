@@ -1,0 +1,33 @@
+services:
+  nanokvm-pi:
+    build:
+      context: .
+      args:
+        NANOKVM_USB_VERSION: "1.1.4"
+    image: nanokvm-pi:latest
+    container_name: nanokvm-pi
+    restart: unless-stopped
+
+    ports:
+      - "47812:80"
+
+    volumes:
+      - /dev:/dev
+
+    device_cgroup_rules:
+      - "c 81:* rmw"
+      - "c 166:* rmw"
+      - "c 188:* rmw"
+      # - "c 116:* rmw"
+
+    environment:
+      VIDEO_RESOLUTION: "1920x1080"
+      VIDEO_FPS: "30"
+      SERIAL_BAUD: "57600"
+      AUDIO: "off"
+      # VIDEO_DEVICE: /dev/video0
+      # SERIAL_DEVICE: /dev/ttyACM0
+      # AUDIO_DEVICE: hw:1
+      # USTREAMER_EXTRA_ARGS: "--encoder=m2m-image"
+      # AUTH_USER: admin
+      # AUTH_PASSWORD: change-me
