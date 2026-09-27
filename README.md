@@ -39,8 +39,10 @@ port.
    ls -l /dev/serial/by-id/ /dev/v4l/by-id/
    ```
 3. `docker compose up -d --build`
-4. Open `http://<pi-ip>:47812`, pick the "NanoKVM-USB via Pi" video device,
-   then click "Select serial device".
+4. Open `http://<pi-ip>:47812`. It connects to the dongle's video and
+   keyboard/mouse by itself; if it can't (say, the dongle is unplugged), the
+   app's device dialog stays up with an error, and you can retry from there.
+   Add `?autoconnect=0` to the URL to always pick devices by hand.
 
 The image is based on Alpine Linux (about 90MB). ustreamer isn't packaged for
 Alpine, so the build compiles a pinned release from source; that takes a
@@ -165,7 +167,7 @@ docker exec nanokvm-pi-test apk add --no-cache py3-pillow
 docker exec -d nanokvm-pi-test python3 /app/fake_mjpeg.py
 ```
 
-Open `http://localhost:47812` and pick the video device. `docker stop
+Open `http://localhost:47812`; the test pattern appears. `docker stop
 nanokvm-pi-test` when done. Keyboard and mouse need the real dongle; audio can
 be faked with `AUDIO=on` and `AUDIO_DEVICE=test` (a 440 Hz tone).
 

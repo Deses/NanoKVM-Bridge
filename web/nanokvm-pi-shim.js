@@ -30,7 +30,7 @@
     return new Promise(function (resolve, reject) {
       ws.addEventListener('open', function () { resolve(ws); }, { once: true });
       ws.addEventListener('close', function () {
-        reject(domException('NetworkError', 'could not connect to the NanoKVM-Pi bridge at ' + path));
+        reject(domException('NetworkError', 'could not connect to ' + path + ' (see /api/status)'));
       }, { once: true });
     });
   }
@@ -227,7 +227,7 @@
     var ws = await openWebSocket('/ws/audio');
     var AudioContextImpl = window.AudioContext || window.webkitAudioContext;
     var ctx = new AudioContextImpl({ sampleRate: AUDIO_SAMPLE_RATE });
-    ctx.resume().catch(function () { /* resumes on the next user gesture */ });
+    startOnFirstInteraction(ctx);
     var destination = ctx.createMediaStreamDestination();
     var nextStart = ctx.currentTime + 0.08; // small jitter buffer
 
@@ -257,6 +257,24 @@
       stop();
     };
     return track;
+  }
+
+  // Auto-connect has no user gesture, so video starts muted (see getUserMedia).
+  // Unmute and start audio on the first click or key.
+  function startOnFirstInteraction(ctx) {
+    var video = document.getElementById('video');
+    ctx.resume().catch(function () { /* needs a gesture */ });
+    function start() {
+      document.removeEventListener('pointerdown', start, true);
+      document.removeEventListener('keydown', start, true);
+      ctx.resume().catch(function () { /* closed meanwhile */ });
+      if (video) {
+        video.muted = false;
+        if (video.paused) video.play().catch(function () { /* no stream yet */ });
+      }
+    }
+    document.addEventListener('pointerdown', start, true);
+    document.addEventListener('keydown', start, true);
   }
 
   function idealDimension(value, fallback) {
@@ -298,6 +316,10 @@
     } catch (e) {
       console.warn('nanokvm-pi: could not set the capture resolution', e);
     }
+
+    // Only muted media may autoplay before a gesture, and the app relies on autoplay.
+    var videoElement = document.getElementById('video');
+    if (videoElement) videoElement.muted = true;
 
     var stream = new MediaStream([createVideoTrack(width, height)]);
     if (constraints.audio) {
@@ -423,6 +445,76 @@
     } catch (e) { /* bridge unreachable - no banner */ }
   }
 
+  // Auto-connect: picks the only video device and clicks "Select serial device",
+  // once per dialog showing. DOM-driven, so a Sipeed UI change only disables it.
+
+  function isShown(el) {
+    return !!el && el.getClientRects().length > 0;
+  }
+
+  async function waitFor(find, timeoutMs) {
+    var deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      var found = find();
+      if (found) return found;
+      await sleep(50);
+    }
+    return null;
+  }
+
+  async function pickOnlyVideoDevice(dialog) {
+    var select = dialog.querySelector('.ant-select');
+    if (!select || select.querySelector('.ant-select-selection-item')) return; // none, or already chosen
+    var selector = select.querySelector('.ant-select-selector');
+    var toggle = function () { selector.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); };
+    toggle();
+    var options = await waitFor(function () {
+      var found = document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option');
+      return found.length ? found : null;
+    }, 2000);
+    if (options && options.length === 1) {
+      options[0].click();
+    } else {
+      toggle(); // several (or no) devices: close the list and leave it to the user
+    }
+  }
+
+  async function clickSerialButton(dialog) {
+    // The dialog's only button; it turns primary once the port is connected.
+    var button = await waitFor(function () {
+      var found = dialog.querySelector('button');
+      return found && !found.classList.contains('ant-btn-loading') ? found : null;
+    }, 2000);
+    if (button && !button.classList.contains('ant-btn-primary')) button.click();
+  }
+
+  function installAutoConnect() {
+    var handled = false;
+    var running = false;
+    async function onDomChange() {
+      var dialog = document.querySelector('.ant-modal');
+      if (!isShown(dialog)) {
+        handled = false;
+        return;
+      }
+      if (handled || running) return;
+      handled = running = true;
+      try {
+        await sleep(300); // let the dialog finish rendering and list devices
+        await pickOnlyVideoDevice(dialog);
+        await clickSerialButton(dialog);
+      } catch (e) {
+        console.warn('nanokvm-pi: auto-connect failed; connect manually', e);
+      } finally {
+        running = false;
+      }
+    }
+    new MutationObserver(onDomChange).observe(document.body, {
+      childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style']
+    });
+    onDomChange();
+  }
+
   // Install
 
   function override(name, value) {
@@ -433,8 +525,9 @@
   override('mediaDevices', { enumerateDevices: enumerateDevices, getUserMedia: getUserMedia });
   installPermissionsShim();
 
-  // Let the app start its own device handshake before asking about updates.
   window.addEventListener('DOMContentLoaded', function () {
+    if (new URLSearchParams(location.search).get('autoconnect') !== '0') installAutoConnect();
+    // Let the app connect to the device before asking about updates.
     setTimeout(checkForUpdate, 1000);
   });
 })();

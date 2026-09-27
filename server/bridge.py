@@ -120,11 +120,14 @@ class SerialBridge:
             "last_error": self.last_error,
         }
 
-    async def add_client(self, ws):
+    def open_if_needed(self):
         self._loop = asyncio.get_running_loop()
-        self.clients.add(ws)
         if self.port is None:
             self._open()
+        return self.port is not None
+
+    def add_client(self, ws):
+        self.clients.add(ws)
 
     def remove_client(self, ws):
         self.clients.discard(ws)
@@ -451,10 +454,18 @@ async def stream_handler(request):
 
 
 async def ws_serial_handler(request):
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
     bridge = request.app[SERIAL]
-    await bridge.add_client(ws)
+    # No device: refuse the handshake so the app shows a connect error.
+    if not bridge.open_if_needed():
+        raise web.HTTPServiceUnavailable(text=bridge.last_error)
+    ws = web.WebSocketResponse()
+    try:
+        await ws.prepare(request)
+    except (ConnectionResetError, aiohttp.ClientError):
+        if not bridge.clients:
+            bridge.close()
+        raise
+    bridge.add_client(ws)
     try:
         async for msg in ws:
             if msg.type == WSMsgType.BINARY:

@@ -49,15 +49,13 @@ def http_get(url):
         return resp.status, resp.headers, resp.read()
 
 
-def connect_app(page, url):
-    page.goto(url, wait_until="networkidle")
-    time.sleep(1)
-    page.locator(".ant-modal .ant-select").first.click()
-    time.sleep(0.3)
-    page.locator(".ant-select-item-option", has_text="NanoKVM-USB via Pi").first.click()
-    time.sleep(0.5)
-    page.get_by_role("button", name="Select serial device").click()
-    time.sleep(1.5)
+def wait_until(predicate, timeout=8.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def main():
@@ -81,16 +79,26 @@ def main():
         check("dotfiles hidden", exc.code == 404)
 
     dongle = serial.Serial(args.pty, 57600, timeout=1)
-    launch = {"executable_path": args.chromium} if args.chromium else {}
+    # Desktop Chrome's autoplay policy; headless is more permissive by default.
+    launch = {"args": ["--autoplay-policy=document-user-activation-required"]}
+    if args.chromium:
+        launch["executable_path"] = args.chromium
     with sync_playwright() as p:
         browser = p.chromium.launch(**launch)
 
-        # --- app connects, video renders
+        # --- the shim connects video and serial by itself, no clicks
         page = browser.new_page(viewport={"width": 1400, "height": 900})
-        connect_app(page, url)
-        check("device modal closes after connecting", not page.locator(".ant-modal").is_visible())
+        page.goto(url)  # not "networkidle": the video stream never goes idle
+        serial_open = lambda: page.evaluate("() => fetch('/api/status').then(r => r.json()).then(s => s.serial.connected)")
+        connected = wait_until(lambda: serial_open() and not page.locator(".ant-modal").is_visible())
+        check("connects automatically (no clicks)", connected)
+        wait_until(lambda: page.eval_on_selector("#video", "el => el.videoWidth") > 0, timeout=3)
         width = page.eval_on_selector("#video", "el => el.videoWidth")
         check("video renders", width > 0, f"videoWidth={width}")
+        t0 = page.eval_on_selector("#video", "el => el.currentTime")
+        time.sleep(1)
+        playing = page.eval_on_selector("#video", "el => !el.paused && el.currentTime")
+        check("video plays without a click (not frozen)", bool(playing) and playing > t0)
 
         # --- keyboard
         dongle.reset_input_buffer()
@@ -107,9 +115,15 @@ def main():
         check("mouse: absolute frames with valid checksums", frames and all(map(checksum_ok, frames)))
         check("mouse: left button pressed then released", 1 in buttons and buttons[-1] == 0, f"buttons={buttons}")
 
-        # --- serial semantics match Web Serial
+        page.close()
+
+        # --- auto-connect can be turned off
         page = browser.new_page()
-        page.goto(url, wait_until="networkidle")
+        page.goto(url + "/?autoconnect=0", wait_until="networkidle")
+        time.sleep(2)
+        check("?autoconnect=0 leaves the device dialog up", page.locator(".ant-modal").is_visible())
+
+        # --- serial semantics match Web Serial (on that page, so auto-connect doesn't race for the port)
         semantics = page.evaluate("""async () => {
             let fired = 0;
             navigator.serial.addEventListener('disconnect', () => fired++);
@@ -123,13 +137,14 @@ def main():
             await port.close();
             return {fired, doubleOpen};
         }""")
+        page.close()
         check("close/reopen fires no disconnect", semantics["fired"] == 0)
         check("opening an open port throws InvalidStateError", semantics["doubleOpen"] == "InvalidStateError")
 
         # --- update banner
         if args.update:
             page = browser.new_page()
-            page.goto(url, wait_until="networkidle")
+            page.goto(url + "/?autoconnect=0", wait_until="networkidle")
             time.sleep(2.5)
             banner = page.locator("text=update available")
             check("update banner shown", banner.is_visible())
