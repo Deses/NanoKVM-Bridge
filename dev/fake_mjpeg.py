@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stand-in for ustreamer: a synthetic MJPEG stream. Run with VIDEO_DEVICE=none; needs Pillow."""
+"""Stand-in for ustreamer: a synthetic MJPEG stream. Run in a VIDEO_DEVICE=none container; needs Pillow."""
 
 import argparse
 import asyncio
@@ -42,20 +42,20 @@ async def stream_handler(request):
         while True:
             frame = make_frame(width, height, counter)
             counter += 1
-            part = (
+            headers = (
                 f"--{BOUNDARY}\r\n"
                 f"Content-Type: image/jpeg\r\n"
                 f"Content-Length: {len(frame)}\r\n\r\n"
             ).encode("ascii")
-            await response.write(part + frame + b"\r\n")
+            await response.write(headers + frame + b"\r\n")
             await asyncio.sleep(1.0 / fps)
-    except (ConnectionResetError, asyncio.CancelledError):
+    except ConnectionResetError:
         pass
     return response
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--width", type=int, default=1280)

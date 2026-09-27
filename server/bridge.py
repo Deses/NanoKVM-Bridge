@@ -15,34 +15,35 @@ import threading
 import time
 
 import aiohttp
-from aiohttp import web, WSMsgType
+import serial
+from aiohttp import WSMsgType, web
 
 import updater
-from updater import WWW_DIR
 
 logging.basicConfig(level=logging.INFO, format="[bridge] %(message)s")
-LOG = logging.getLogger("nanokvm-pi-bridge")
+LOG = logging.getLogger("nanokvm-pi")
 
-BRIDGE_HOST = "0.0.0.0"
-BRIDGE_PORT = 80
+HTTP_PORT = 80
 STREAM_PORT = 8081
+SHIM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nanokvm-pi-shim.js")
+NO_CACHE_PATHS = {"/", "/index.html", "/nanokvm-pi-shim.js"}
 
 SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "57600"))
-VIDEO_FPS = os.environ.get("VIDEO_FPS", "30")
+VIDEO_RESOLUTION = os.environ.get("VIDEO_RESOLUTION", "1920x1080")
+VIDEO_FPS = int(os.environ.get("VIDEO_FPS", "30"))
 USTREAMER_EXTRA_ARGS = shlex.split(os.environ.get("USTREAMER_EXTRA_ARGS", ""))
 AUDIO_ENABLED = os.environ.get("AUDIO", "off").strip().lower() in ("1", "true", "on", "yes")
 AUDIO_RATE = 48000
 AUDIO_CHANNELS = 2
-
-AUTH_USER = os.environ.get("AUTH_USER")
-AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD")
+AUTH_USER = os.environ.get("AUTH_USER", "")
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
+AUTH_ENABLED = bool(AUTH_USER and AUTH_PASSWORD)
 
 
 # Re-resolved on every (re)connect, so a replugged dongle is found again.
 def resolve_serial_device():
-    env = os.environ.get("SERIAL_DEVICE")
-    if env:
-        return env
+    if os.environ.get("SERIAL_DEVICE"):
+        return os.environ["SERIAL_DEVICE"]
     matches = sorted(glob.glob("/dev/serial/by-id/*"))
     if matches:
         return matches[0]
@@ -53,336 +54,327 @@ def resolve_serial_device():
 
 
 def resolve_video_device():
-    env = os.environ.get("VIDEO_DEVICE")
+    env = os.environ.get("VIDEO_DEVICE", "").strip()
     if env:
-        return None if env.strip().lower() == "none" else env
+        return None if env.lower() == "none" else env
+    # index1 is the capture card's metadata-only node.
     matches = sorted(glob.glob("/dev/v4l/by-id/*-video-index0"))
     if matches:
         return matches[0]
-    if os.path.exists("/dev/video0"):
-        return "/dev/video0"
-    return None
+    return "/dev/video0" if os.path.exists("/dev/video0") else None
 
 
 def resolve_audio_device():
-    env = os.environ.get("AUDIO_DEVICE")
-    if env:
-        return env  # "test": synthetic tone
+    if os.environ.get("AUDIO_DEVICE"):
+        return os.environ["AUDIO_DEVICE"]  # "test": synthetic tone
     try:
         with open("/proc/asound/cards") as f:
-            content = f.read()
+            lines = f.read().splitlines()
     except OSError:
         return None
-    for line in content.splitlines():
+    for line in lines:
         line = line.strip()
-        if line and line[0].isdigit() and "USB-Audio" in line:
-            return f"hw:{line.split()[0]}"
+        if line[:1].isdigit() and "USB-Audio" in line:
+            # plughw converts to the rate/channels we ask for.
+            return f"plughw:{line.split()[0]}"
     return None
+
+
+def parse_resolution(value):
+    try:
+        width, height = value.lower().split("x")
+        return int(width), int(height)
+    except ValueError:
+        LOG.warning("invalid VIDEO_RESOLUTION %r, using 1920x1080", value)
+        return 1920, 1080
+
+
+async def broadcast(clients, data):
+    for ws in list(clients):
+        try:
+            await ws.send_bytes(data)
+        except (ConnectionResetError, RuntimeError):
+            clients.discard(ws)
 
 
 class SerialBridge:
     def __init__(self):
-        self.loop = None
         self.clients = set()
         self.port = None
-        self.device_path = None
         self.last_error = None
-        self._stop_flag = threading.Event()
-        self._reader_thread = None
+        self._stop = None
+        self._loop = None
 
     def status(self):
         return {
-            "device": self.device_path,
-            "connected": self.port is not None and self.port.is_open,
+            "device": self.port.port if self.port else resolve_serial_device(),
+            "connected": self.port is not None,
             "clients": len(self.clients),
             "baud_rate": SERIAL_BAUD,
             "last_error": self.last_error,
         }
 
     async def add_client(self, ws):
-        self.loop = asyncio.get_running_loop()
+        self._loop = asyncio.get_running_loop()
         self.clients.add(ws)
         if self.port is None:
             self._open()
 
-    async def remove_client(self, ws):
+    def remove_client(self, ws):
         self.clients.discard(ws)
         if not self.clients:
-            self._close()
+            self.close()
 
-    def write(self, data: bytes):
-        if not self.port:
+    def write(self, data):
+        if self.port is None:
             return
         try:
             self.port.write(data)
-        except Exception as exc:  # noqa: BLE001 - report and keep serving
+        except (serial.SerialException, OSError) as exc:
             self.last_error = f"write failed: {exc}"
             LOG.warning(self.last_error)
 
     def _open(self):
-        import serial  # local import: keeps module importable without pyserial for tests
-
         device = resolve_serial_device()
-        self.device_path = device
         if not device:
             self.last_error = "no serial device found"
             LOG.warning(self.last_error)
             return
         try:
-            self.port = serial.Serial(device, SERIAL_BAUD, timeout=0.2)
-        except Exception as exc:  # noqa: BLE001
+            port = serial.Serial(device, SERIAL_BAUD, timeout=0.2)
+        except (serial.SerialException, OSError) as exc:
             self.last_error = f"failed to open {device}: {exc}"
             LOG.warning(self.last_error)
-            self.port = None
             return
-
-        self.last_error = None
-        self._stop_flag.clear()
-        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader_thread.start()
+        # Per-open stop event, so a lingering reader thread never reads the new port.
+        stop = threading.Event()
+        self.port, self._stop, self.last_error = port, stop, None
+        threading.Thread(target=self._read_loop, args=(port, stop), daemon=True).start()
         LOG.info("serial opened: %s @ %d baud", device, SERIAL_BAUD)
 
-    def _close(self):
-        self._stop_flag.set()
-        if self.port:
-            try:
-                self.port.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self.port = None
-        LOG.info("serial closed (no clients)")
+    def close(self):
+        if self.port is None:
+            return
+        self._stop.set()
+        try:
+            self.port.close()
+        except (serial.SerialException, OSError):
+            pass
+        self.port = self._stop = None
+        LOG.info("serial closed")
 
-    def _read_loop(self):
-        # Own thread: pyserial's blocking read() would stall the event loop.
-        while not self._stop_flag.is_set() and self.port:
+    def _read_loop(self, port, stop):
+        while not stop.is_set():
             try:
-                data = self.port.read(256)
-            except Exception as exc:  # noqa: BLE001 - device unplugged etc.
-                if self._stop_flag.is_set():
-                    # Closed by _close(), not a device error.
-                    return
-                self.last_error = f"read failed: {exc}"
-                LOG.warning(self.last_error)
-                if self.loop:
-                    asyncio.run_coroutine_threadsafe(self._disconnect_all(), self.loop)
+                data = port.read(256)
+            except Exception as exc:  # unplugged, or closed under us
+                if not stop.is_set():
+                    asyncio.run_coroutine_threadsafe(self._device_lost(port, exc), self._loop)
                 return
-            if data and self.loop:
-                asyncio.run_coroutine_threadsafe(self._broadcast(data), self.loop)
+            if data:
+                asyncio.run_coroutine_threadsafe(broadcast(self.clients, data), self._loop)
 
-    async def _broadcast(self, data: bytes):
+    async def _device_lost(self, port, exc):
+        if self.port is not port:
+            return
+        self.last_error = f"read failed: {exc}"
+        LOG.warning(self.last_error)
+        self.close()
+        # Closing the sockets makes the app show its device picker again.
         for ws in list(self.clients):
-            try:
-                await ws.send_bytes(data)
-            except Exception:  # noqa: BLE001
-                self.clients.discard(ws)
-
-    async def _disconnect_all(self):
-        for ws in list(self.clients):
-            try:
-                await ws.close()
-            except Exception:  # noqa: BLE001
-                pass
+            await ws.close()
         self.clients.clear()
-        self._close()
 
 
 class Streamer:
     def __init__(self):
-        self.device = resolve_video_device()
-        self.enabled = self.device is not None
-        self.width, self.height = self._parse_resolution(
-            os.environ.get("VIDEO_RESOLUTION", "1920x1080")
-        )
-        self.fps = VIDEO_FPS
+        self.device = None
+        self.width, self.height = parse_resolution(VIDEO_RESOLUTION)
         self.proc = None
-        self._last_spawn = 0.0
-
-    @staticmethod
-    def _parse_resolution(res: str):
-        try:
-            w, h = res.lower().split("x")
-            return int(w), int(h)
-        except Exception:  # noqa: BLE001
-            return 1920, 1080
+        self._lock = asyncio.Lock()
+        self._spawned_at = 0.0
+        self._next_spawn = 0.0
 
     def status(self):
         return {
-            "enabled": self.enabled,
             "device": self.device,
-            "running": self.proc is not None and self.proc.poll() is None,
+            "running": self._running(),
             "resolution": f"{self.width}x{self.height}",
-            "fps": self.fps,
+            "fps": VIDEO_FPS,
         }
 
-    def start(self):
-        if not self.enabled:
-            LOG.warning("no video device found; /stream will be unavailable")
-            return
-        self._spawn()
+    def _running(self):
+        return self.proc is not None and self.proc.poll() is None
 
-    def stop(self):
-        if not self.proc:
-            return
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-        self.proc = None
+    async def set_resolution(self, width, height):
+        async with self._lock:
+            if (width, height) == (self.width, self.height):
+                return
+            self.width, self.height = width, height
+            if self.device:
+                LOG.info("restarting ustreamer at %dx%d", width, height)
+                await self._terminate()
+                self._spawn()
 
-    def set_resolution(self, width: int, height: int):
-        if (width, height) == (self.width, self.height):
-            return
-        self.width, self.height = width, height
-        if self.enabled:
-            LOG.info("resolution changed, restarting ustreamer at %dx%d", width, height)
-            self.stop()
-            self._spawn()
+    async def stop(self):
+        async with self._lock:
+            await self._terminate()
+
+    async def supervise(self):
+        delay = 1.0
+        warned = False
+        while True:
+            async with self._lock:
+                if self.device is None:
+                    self.device = resolve_video_device()
+                    if self.device:
+                        LOG.info("video device: %s", self.device)
+                    elif not warned:
+                        LOG.warning("no video device found yet; /stream is unavailable")
+                        warned = True
+                if self.device and not self._running():
+                    if self.proc is not None:
+                        uptime = time.monotonic() - self._spawned_at
+                        delay = 1.0 if uptime > 30 else min(delay * 2, 30.0)
+                        LOG.warning(
+                            "ustreamer exited (code %s), restarting in %.0fs",
+                            self.proc.returncode, delay,
+                        )
+                        self.proc = None
+                        self._next_spawn = time.monotonic() + delay
+                    if time.monotonic() >= self._next_spawn:
+                        self._spawn()
+            await asyncio.sleep(1)
 
     def _spawn(self):
         cmd = [
             "ustreamer",
             "--device", self.device,
             "--format", "MJPEG",
+            "--encoder", "HW",  # forward the dongle's JPEGs as-is
             "--resolution", f"{self.width}x{self.height}",
-            "--desired-fps", str(self.fps),
+            "--desired-fps", str(VIDEO_FPS),
             "--drop-same-frames", "30",
+            "--slowdown",
+            "--exit-on-parent-death",
             "--host", "127.0.0.1",
             "--port", str(STREAM_PORT),
             *USTREAMER_EXTRA_ARGS,
         ]
-        LOG.info("starting ustreamer: %s", " ".join(cmd))
-        self._last_spawn = time.time()
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        LOG.info("starting %s", " ".join(cmd))
+        self._spawned_at = time.monotonic()
+        self.proc = subprocess.Popen(cmd)
 
-    async def watchdog(self):
-        backoff = 1.0
-        while True:
-            await asyncio.sleep(2)
-            if not self.enabled:
-                continue
-            if self.proc is not None and self.proc.poll() is None:
-                backoff = 1.0
-                continue
-            if time.time() - self._last_spawn < backoff:
-                continue
-            backoff = min(backoff * 2, 30.0)
-            LOG.warning("ustreamer is not running, restarting")
-            self._spawn()
+    async def _terminate(self):
+        proc, self.proc = self.proc, None
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            await asyncio.to_thread(proc.wait, 3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            await asyncio.to_thread(proc.wait)
 
 
 class AudioBridge:
     def __init__(self):
-        self.loop = None
         self.clients = set()
-        self.enabled = AUDIO_ENABLED
-        self.device = resolve_audio_device() if self.enabled else None
-        self.proc = None
+        self.device = resolve_audio_device() if AUDIO_ENABLED else None
+        self._stop = None
         self._thread = None
-        self._stop_flag = threading.Event()
+        self._loop = None
 
     def status(self):
-        running = False
-        if self._thread is not None:
-            running = self._thread.is_alive()
         return {
-            "enabled": self.enabled,
+            "enabled": AUDIO_ENABLED,
             "device": self.device,
-            "running": running,
+            "running": self._thread is not None and self._thread.is_alive(),
             "clients": len(self.clients),
         }
 
     async def add_client(self, ws):
-        if not self.enabled:
-            return
-        self.loop = asyncio.get_running_loop()
+        self._loop = asyncio.get_running_loop()
         self.clients.add(ws)
-        if self._thread is None or not self._thread.is_alive():
+        if self._stop is None or not self._thread.is_alive():
             self._start()
 
-    async def remove_client(self, ws):
+    def remove_client(self, ws):
         self.clients.discard(ws)
         if not self.clients:
-            self._stop()
+            self.stop()
+
+    def stop(self):
+        if self._stop is not None:
+            self._stop.set()
+            self._stop = self._thread = None
 
     def _start(self):
         if not self.device:
-            LOG.warning("audio enabled but no capture device found")
+            LOG.warning("AUDIO=on but no USB audio capture device found")
             return
-        self._stop_flag.clear()
+        stop = threading.Event()
         target = self._tone_loop if self.device == "test" else self._arecord_loop
-        self._thread = threading.Thread(target=target, daemon=True)
+        self._stop = stop
+        self._thread = threading.Thread(target=target, args=(stop,), daemon=True)
         self._thread.start()
 
-    def _stop(self):
-        self._stop_flag.set()
-        if self.proc:
-            self.proc.terminate()
-            self.proc = None
+    def _send(self, data):
+        asyncio.run_coroutine_threadsafe(broadcast(self.clients, data), self._loop)
 
-    def _arecord_loop(self):
+    def _arecord_loop(self, stop):
         cmd = [
-            "arecord", "-D", self.device,
+            "arecord", "-q", "-D", self.device, "-t", "raw",
             "-f", "S16_LE", "-r", str(AUDIO_RATE), "-c", str(AUDIO_CHANNELS),
-            "-t", "raw", "-q",
         ]
         try:
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("failed to start arecord: %s", exc)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            LOG.warning("arecord not found - rebuild the image with WITH_AUDIO=true")
             return
-        chunk_size = int(AUDIO_RATE * AUDIO_CHANNELS * 2 * 0.02)  # ~20ms of audio
-        while not self._stop_flag.is_set():
-            data = self.proc.stdout.read(chunk_size)
-            if not data:
-                break
-            if self.loop:
-                asyncio.run_coroutine_threadsafe(self._broadcast(data), self.loop)
-        if self.proc:
-            self.proc.terminate()
-            self.proc = None
+        chunk_size = AUDIO_RATE * AUDIO_CHANNELS * 2 // 50  # 20ms
+        try:
+            while not stop.is_set():
+                data = proc.stdout.read(chunk_size)
+                if not data:
+                    break
+                self._send(data)
+        finally:
+            proc.terminate()
+            _, err = proc.communicate()
+            if not stop.is_set():
+                LOG.warning("arecord exited: %s", err.decode(errors="replace").strip())
 
-    def _tone_loop(self):
-        # Synthetic 440Hz tone so the audio path can be exercised without hardware.
-        freq = 440.0
-        chunk_ms = 20
-        samples_per_chunk = int(AUDIO_RATE * chunk_ms / 1000)
-        sample_index = 0
-        while not self._stop_flag.is_set():
+    def _tone_loop(self, stop):
+        samples = AUDIO_RATE // 50  # 20ms
+        index = 0
+        while not stop.is_set():
             buf = bytearray()
-            for _ in range(samples_per_chunk):
-                value = int(3000 * math.sin(2 * math.pi * freq * sample_index / AUDIO_RATE))
+            for _ in range(samples):
+                value = int(3000 * math.sin(2 * math.pi * 440 * index / AUDIO_RATE))
                 buf += struct.pack("<hh", value, value)
-                sample_index += 1
-            if self.loop:
-                asyncio.run_coroutine_threadsafe(self._broadcast(bytes(buf)), self.loop)
-            time.sleep(chunk_ms / 1000)
+                index += 1
+            self._send(bytes(buf))
+            time.sleep(0.02)
 
-    async def _broadcast(self, data: bytes):
-        for ws in list(self.clients):
-            try:
-                await ws.send_bytes(data)
-            except Exception:  # noqa: BLE001
-                self.clients.discard(ws)
+
+def _credentials_match(header):
+    if not header.startswith("Basic "):
+        return False
+    try:
+        user, _, password = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+    except ValueError:
+        return False
+    # compare_digest rejects non-ASCII str.
+    user_ok = hmac.compare_digest(user.encode(), AUTH_USER.encode())
+    password_ok = hmac.compare_digest(password.encode(), AUTH_PASSWORD.encode())
+    return user_ok and password_ok
 
 
 @web.middleware
-async def basic_auth_middleware(request, handler):
-    if not AUTH_USER or not AUTH_PASSWORD:
+async def auth_middleware(request, handler):
+    if not AUTH_ENABLED or _credentials_match(request.headers.get("Authorization", "")):
         return await handler(request)
-
-    header = request.headers.get("Authorization", "")
-    if header.startswith("Basic "):
-        try:
-            decoded = base64.b64decode(header[6:]).decode("utf-8")
-            user, _, password = decoded.partition(":")
-        except Exception:  # noqa: BLE001 - malformed header, fall through to 401
-            user = password = None
-        if user is not None and hmac.compare_digest(user, AUTH_USER) and hmac.compare_digest(
-            password, AUTH_PASSWORD
-        ):
-            return await handler(request)
-
     return web.Response(
         status=401,
         headers={"WWW-Authenticate": 'Basic realm="NanoKVM-Pi"'},
@@ -392,49 +384,49 @@ async def basic_auth_middleware(request, handler):
 
 @web.middleware
 async def hide_dotfiles_middleware(request, handler):
-    # Dotfiles (e.g. .nanokvm-usb-version) are never served.
-    if any(part.startswith(".") for part in request.path.split("/") if part):
+    if any(part.startswith(".") for part in request.path.split("/")):
         raise web.HTTPNotFound()
     return await handler(request)
 
 
-async def add_security_headers(request, response):
+async def add_response_headers(request, response):
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    if request.path in NO_CACHE_PATHS:
+        # So an updated frontend never references stale cached asset hashes.
+        response.headers["Cache-Control"] = "no-cache"
 
 
 async def index_handler(request):
-    index_path = os.path.join(WWW_DIR, "index.html")
+    index_path = os.path.join(updater.WWW_DIR, "index.html")
     if not os.path.isfile(index_path):
-        raise web.HTTPServiceUnavailable(text="frontend not seeded yet")
+        raise web.HTTPServiceUnavailable(text="frontend not installed")
     return web.FileResponse(index_path)
 
 
-async def stream_handler(request):
-    streamer = request.app["streamer"]
-    if not streamer.enabled:
-        raise web.HTTPServiceUnavailable(text="no video device configured")
+async def shim_handler(request):
+    return web.FileResponse(SHIM_PATH)
 
-    session = request.app["http_client"]
+
+async def stream_handler(request):
     try:
-        upstream = await session.get(
+        upstream = await request.app["http_client"].get(
             f"http://127.0.0.1:{STREAM_PORT}/stream",
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=5),
         )
-    except Exception as exc:  # noqa: BLE001 - ustreamer not up yet/crashed
-        raise web.HTTPBadGateway(text=f"video stream unavailable: {exc}")
+    except aiohttp.ClientError as exc:
+        raise web.HTTPServiceUnavailable(text=f"video stream unavailable: {exc}")
 
-    response = web.StreamResponse(
-        status=upstream.status,
-        headers={"Content-Type": upstream.headers.get("Content-Type", "multipart/x-mixed-replace")},
-    )
-    # Unbuffered, so latency doesn't build up.
-    await response.prepare(request)
     try:
+        response = web.StreamResponse(
+            status=upstream.status,
+            headers={"Content-Type": upstream.headers.get("Content-Type", "text/plain")},
+        )
+        await response.prepare(request)
         async for chunk in upstream.content.iter_any():
             await response.write(chunk)
-    except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientConnectionError):
-        pass
+    except (ConnectionResetError, aiohttp.ClientError):
+        pass  # viewer left or ustreamer restarted; the shim reconnects
     finally:
         upstream.close()
     return response
@@ -443,104 +435,107 @@ async def stream_handler(request):
 async def ws_serial_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    bridge = request.app["serial_bridge"]
+    bridge = request.app["serial"]
     await bridge.add_client(ws)
     try:
         async for msg in ws:
             if msg.type == WSMsgType.BINARY:
                 bridge.write(msg.data)
-            elif msg.type == WSMsgType.ERROR:
-                break
     finally:
-        await bridge.remove_client(ws)
+        bridge.remove_client(ws)
     return ws
 
 
 async def ws_audio_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    bridge = request.app["audio_bridge"]
-    if not bridge.enabled:
-        await ws.close(code=1000, message=b"audio disabled")
+    if not AUDIO_ENABLED:
+        await ws.close(message=b"audio disabled")
         return ws
+    bridge = request.app["audio"]
     await bridge.add_client(ws)
     try:
-        async for _msg in ws:
-            pass  # audio only flows Pi -> browser; ignore anything inbound
+        async for _ in ws:
+            pass
     finally:
-        await bridge.remove_client(ws)
+        bridge.remove_client(ws)
     return ws
 
 
 async def api_status(request):
-    app = request.app
     return web.json_response({
-        "serial": app["serial_bridge"].status(),
-        "video": app["streamer"].status(),
-        "audio": app["audio_bridge"].status(),
+        "serial": request.app["serial"].status(),
+        "video": request.app["streamer"].status(),
+        "audio": request.app["audio"].status(),
     })
 
 
 async def api_video(request):
     try:
         body = await request.json()
-        width = int(body["width"])
-        height = int(body["height"])
-    except Exception:  # noqa: BLE001
-        return web.json_response({"error": "expected JSON {width, height}"}, status=400)
-    request.app["streamer"].set_resolution(width, height)
+        width, height = int(body["width"]), int(body["height"])
+    except (ValueError, KeyError, TypeError):
+        raise web.HTTPBadRequest(text='expected JSON {"width": int, "height": int}')
+    if not (1 <= width <= 7680 and 1 <= height <= 4320):
+        raise web.HTTPBadRequest(text="resolution out of range")
+    await request.app["streamer"].set_resolution(width, height)
     return web.json_response({"ok": True})
 
 
 async def api_version(request):
-    upd = request.app["updater"]
-    upd.maybe_refresh()
-    return web.json_response(upd.status())
+    return web.json_response(request.app["updater"].status())
 
 
 async def api_update(request):
-    upd = request.app["updater"]
     version = None
     if request.can_read_body:
         try:
             body = await request.json()
-            version = body.get("version") if body else None
-        except Exception:  # noqa: BLE001 - empty/non-JSON body means "use latest"
-            version = None
+        except ValueError:
+            raise web.HTTPBadRequest(text="expected a JSON body")
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text='expected JSON {"version": "x.y.z"}')
+        version = body.get("version")
     try:
-        installed = await upd.perform_update(version)
-    except Exception as exc:  # noqa: BLE001 - reported to the caller, not fatal
+        installed = await request.app["updater"].perform_update(version)
+    except updater.UpdateError as exc:
         return web.json_response({"error": str(exc)}, status=409)
     return web.json_response({"ok": True, "version": installed})
 
 
 async def on_startup(app):
     app["http_client"] = aiohttp.ClientSession()
-    app["streamer"].start()
-    app["streamer_task"] = asyncio.create_task(app["streamer"].watchdog())
-    app["updater_task"] = asyncio.create_task(app["updater"].watchdog())
+    app["tasks"] = [
+        asyncio.create_task(app["streamer"].supervise()),
+        asyncio.create_task(app["updater"].run()),
+    ]
+
+
+async def on_shutdown(app):
+    # WebSocket handlers never return on their own; close them so `docker stop` doesn't SIGKILL.
+    for ws in list(app["serial"].clients) + list(app["audio"].clients):
+        await ws.close(code=aiohttp.WSCloseCode.GOING_AWAY, message=b"shutting down")
 
 
 async def on_cleanup(app):
-    for key in ("streamer_task", "updater_task"):
-        task = app.get(key)
-        if task:
-            task.cancel()
+    for task in app["tasks"]:
+        task.cancel()
     await app["http_client"].close()
-    app["streamer"].stop()
-    app["serial_bridge"]._close()  # noqa: SLF001 - internal, shutdown path only
-    app["audio_bridge"]._stop()  # noqa: SLF001
+    await app["streamer"].stop()
+    app["serial"].close()
+    app["audio"].stop()
 
 
 def create_app():
-    app = web.Application(middlewares=[basic_auth_middleware, hide_dotfiles_middleware])
-    app["serial_bridge"] = SerialBridge()
-    app["audio_bridge"] = AudioBridge()
+    app = web.Application(middlewares=[auth_middleware, hide_dotfiles_middleware])
+    app["serial"] = SerialBridge()
+    app["audio"] = AudioBridge()
     app["streamer"] = Streamer()
     app["updater"] = updater.Updater()
 
     # Static route last: it matches every path.
     app.router.add_get("/", index_handler)
+    app.router.add_get("/nanokvm-pi-shim.js", shim_handler)
     app.router.add_get("/stream", stream_handler)
     app.router.add_get("/ws/serial", ws_serial_handler)
     app.router.add_get("/ws/audio", ws_audio_handler)
@@ -548,18 +543,21 @@ def create_app():
     app.router.add_post("/api/video", api_video)
     app.router.add_get("/api/version", api_version)
     app.router.add_post("/api/update", api_update)
-    app.router.add_static("/", WWW_DIR, show_index=False)
+    app.router.add_static("/", updater.WWW_DIR)
 
-    app.on_response_prepare.append(add_security_headers)
+    app.on_response_prepare.append(add_response_headers)
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_cleanup)
     return app
 
 
 def main():
-    LOG.info("audio %s", "enabled" if AUDIO_ENABLED else "disabled")
-    LOG.info("auth %s", f"enabled (user '{AUTH_USER}')" if AUTH_USER and AUTH_PASSWORD else "disabled")
-    web.run_app(create_app(), host=BRIDGE_HOST, port=BRIDGE_PORT, print=None)
+    LOG.info("audio %s, auth %s",
+             "on" if AUDIO_ENABLED else "off",
+             f"on (user {AUTH_USER!r})" if AUTH_ENABLED else "off")
+    # A short shutdown_timeout cancels still-open /stream proxies promptly.
+    web.run_app(create_app(), port=HTTP_PORT, shutdown_timeout=3, print=None)
 
 
 if __name__ == "__main__":

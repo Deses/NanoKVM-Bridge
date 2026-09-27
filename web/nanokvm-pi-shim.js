@@ -3,14 +3,17 @@
 (function () {
   'use strict';
 
-  var FAKE_VIDEO_ID = 'nanokvm-pi-video';
-  var FAKE_AUDIO_ID = 'nanokvm-pi-audio';
-  var FAKE_GROUP_ID = 'nanokvm-pi-group';
-  var DOUBLE_CRLF = new Uint8Array([13, 10, 13, 10]);
+  var VIDEO_DEVICE_ID = 'nanokvm-pi-video';
+  var AUDIO_DEVICE_ID = 'nanokvm-pi-audio';
+  var DEVICE_GROUP_ID = 'nanokvm-pi';
+  var AUDIO_SAMPLE_RATE = 48000;
+  var AUDIO_CHANNELS = 2;
+  var RETRY_MS = 500;
+  var MAX_STREAM_BUFFER = 8 * 1024 * 1024;
+  var CRLF2 = new Uint8Array([13, 10, 13, 10]);
 
   function wsUrl(path) {
-    var proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    return proto + '://' + window.location.host + path;
+    return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + path;
   }
 
   function sleep(ms) {
@@ -18,26 +21,100 @@
   }
 
   function domException(name, message) {
-    try {
-      return new DOMException(message, name);
-    } catch (e) {
-      var err = new Error(message);
-      err.name = name;
-      return err;
-    }
+    return new DOMException(message, name);
   }
 
+  function openWebSocket(path) {
+    var ws = new WebSocket(wsUrl(path));
+    ws.binaryType = 'arraybuffer';
+    return new Promise(function (resolve, reject) {
+      ws.addEventListener('open', function () { resolve(ws); }, { once: true });
+      ws.addEventListener('close', function () {
+        reject(domException('NetworkError', 'could not connect to the NanoKVM-Pi bridge at ' + path));
+      }, { once: true });
+    });
+  }
+
+  // navigator.serial
+
+  var serialListeners = new Set();
+  var serialPort = null;
+
+  // Like real Web Serial, 'disconnect' fires only when the device goes away,
+  // never for an explicit port.close().
+  function RemoteSerialPort() {
+    this._ws = null;
+    this.readable = null;
+    this.writable = null;
+  }
+
+  RemoteSerialPort.prototype.open = async function () {
+    if (this._ws) throw domException('InvalidStateError', 'port is already open');
+    var port = this;
+    var ws = await openWebSocket('/ws/serial');
+    port._ws = ws;
+
+    port.readable = new ReadableStream({
+      start: function (controller) {
+        ws.addEventListener('message', function (ev) {
+          if (!(ev.data instanceof ArrayBuffer)) return;
+          try { controller.enqueue(new Uint8Array(ev.data)); } catch (e) { /* reader cancelled */ }
+        });
+        ws.addEventListener('close', function () {
+          try { controller.close(); } catch (e) { /* already closed */ }
+          if (port._ws !== ws) return;
+          port._ws = port.readable = port.writable = null;
+          var event = { type: 'disconnect', target: port };
+          serialListeners.forEach(function (listener) { listener(event); });
+        });
+      }
+    });
+
+    port.writable = new WritableStream({
+      write: function (chunk) {
+        if (ws.readyState !== WebSocket.OPEN) {
+          throw domException('NetworkError', 'the device has been disconnected');
+        }
+        ws.send(chunk);
+      }
+    });
+  };
+
+  RemoteSerialPort.prototype.close = async function () {
+    var ws = this._ws;
+    this._ws = this.readable = this.writable = null;
+    if (ws) ws.close();
+  };
+
+  var remoteSerial = {
+    requestPort: async function () {
+      if (!serialPort) serialPort = new RemoteSerialPort();
+      return serialPort;
+    },
+    getPorts: async function () {
+      return serialPort ? [serialPort] : [];
+    },
+    addEventListener: function (type, listener) {
+      if (type === 'disconnect') serialListeners.add(listener);
+    },
+    removeEventListener: function (type, listener) {
+      if (type === 'disconnect') serialListeners.delete(listener);
+    }
+  };
+
+  // navigator.mediaDevices: MJPEG over HTTP -> canvas -> MediaStream
+
   function concatBytes(a, b) {
+    if (a.length === 0) return b;
     var out = new Uint8Array(a.length + b.length);
     out.set(a, 0);
     out.set(b, a.length);
     return out;
   }
 
-  function indexOfBytes(haystack, needle, fromIndex) {
-    if (needle.length === 0) return -1;
-    var limit = haystack.length - needle.length;
-    outer: for (var i = Math.max(fromIndex, 0); i <= limit; i++) {
+  function indexOfBytes(haystack, needle, from) {
+    var last = haystack.length - needle.length;
+    outer: for (var i = from; i <= last; i++) {
       for (var j = 0; j < needle.length; j++) {
         if (haystack[i + j] !== needle[j]) continue outer;
       }
@@ -46,278 +123,167 @@
     return -1;
   }
 
-  async function fetchStatus() {
+  // null if more data is needed, else { jpeg, end }; jpeg is null for parts
+  // without a Content-Length.
+  function nextPart(buffer, boundary) {
+    var start = indexOfBytes(buffer, boundary, 0);
+    if (start === -1) return null;
+    var headersStart = start + boundary.length;
+    var headersEnd = indexOfBytes(buffer, CRLF2, headersStart);
+    if (headersEnd === -1) return null;
+    var headers = new TextDecoder().decode(buffer.subarray(headersStart, headersEnd));
+    var length = /Content-Length:\s*(\d+)/i.exec(headers);
+    var bodyStart = headersEnd + CRLF2.length;
+    if (!length) return { jpeg: null, end: bodyStart };
+    var bodyEnd = bodyStart + parseInt(length[1], 10);
+    if (buffer.length < bodyEnd) return null;
+    return { jpeg: buffer.subarray(bodyStart, bodyEnd), end: bodyEnd };
+  }
+
+  async function drawFrame(jpeg, video) {
+    var bitmap;
     try {
-      var res = await fetch('/api/status', { cache: 'no-store' });
-      if (!res.ok) return null;
-      return await res.json();
+      bitmap = await createImageBitmap(new Blob([jpeg], { type: 'image/jpeg' }));
     } catch (e) {
-      return null;
+      return; // corrupt frame
     }
+    if (video.canvas.width !== bitmap.width || video.canvas.height !== bitmap.height) {
+      video.canvas.width = bitmap.width;
+      video.canvas.height = bitmap.height;
+    }
+    video.ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    if (video.requestFrame) video.track.requestFrame();
   }
 
-  // navigator.serial
-
-  var serialListeners = new Set();
-  var currentPort = null;
-
-  function fireSerialDisconnect(port) {
-    var event = { type: 'disconnect', target: port };
-    serialListeners.forEach(function (handler) {
-      try { handler(event); } catch (e) { console.error('nanokvm-pi: serial listener error', e); }
-    });
-  }
-
-  function RemotePort() {
-    this._ws = null;
-    this.readable = null;
-    this.writable = null;
-  }
-
-  RemotePort.prototype.open = async function (options) {
-    var port = this;
-    var ws = new WebSocket(wsUrl('/ws/serial'));
-    ws.binaryType = 'arraybuffer';
-
-    await new Promise(function (resolve, reject) {
-      ws.addEventListener('open', function onOpen() { resolve(); }, { once: true });
-      ws.addEventListener('error', function onError() {
-        reject(domException('NetworkError', 'failed to reach the NanoKVM-Pi bridge (/ws/serial)'));
-      }, { once: true });
-    });
-
-    port._ws = ws;
-
-    port.readable = new ReadableStream({
-      start: function (controller) {
-        ws.addEventListener('message', function (ev) {
-          if (ev.data instanceof ArrayBuffer) {
-            controller.enqueue(new Uint8Array(ev.data));
-          }
-        });
-        ws.addEventListener('close', function () {
-          try { controller.close(); } catch (e) { /* already closed */ }
-          fireSerialDisconnect(port);
-        });
-        ws.addEventListener('error', function () {
-          try { controller.error(domException('NetworkError', 'serial websocket error')); } catch (e) { /* noop */ }
-        });
-      },
-      cancel: function () {
-        try { ws.close(); } catch (e) { /* noop */ }
-      }
-    });
-
-    port.writable = new WritableStream({
-      write: function (chunk) {
-        ws.send(chunk);
-      },
-      close: function () {
-        try { ws.close(); } catch (e) { /* noop */ }
-      },
-      abort: function () {
-        try { ws.close(); } catch (e) { /* noop */ }
-      }
-    });
-  };
-
-  RemotePort.prototype.close = async function () {
-    if (this._ws) {
-      try { this._ws.close(); } catch (e) { /* noop */ }
-    }
-  };
-
-  var fakeSerial = {
-    requestPort: async function () {
-      if (!currentPort) currentPort = new RemotePort();
-      return currentPort;
-    },
-    getPorts: async function () {
-      return currentPort ? [currentPort] : [];
-    },
-    addEventListener: function (type, handler) {
-      if (type === 'disconnect') serialListeners.add(handler);
-    },
-    removeEventListener: function (type, handler) {
-      if (type === 'disconnect') serialListeners.delete(handler);
-    }
-  };
-
-  // navigator.mediaDevices
-
-  function createCanvasVideoTrack(canvas) {
-    var stream = canvas.captureStream(0);
-    var track = stream.getVideoTracks()[0];
-    var useRequestFrame = typeof track.requestFrame === 'function';
-    if (!useRequestFrame) {
-      // No on-demand frames in this browser: capture at a fixed rate instead.
-      stream = canvas.captureStream(30);
-      track = stream.getVideoTracks()[0];
-    }
-    return { stream: stream, track: track, useRequestFrame: useRequestFrame };
-  }
-
-  async function pumpMjpeg(canvas, ctx, videoHandle, state) {
-    while (!state.stopped) {
+  async function pumpMjpeg(video) {
+    while (!video.stopped) {
       try {
-        var res = await fetch('/stream', { signal: state.abortController.signal, cache: 'no-store' });
-        if (!res.body) throw new Error('stream response has no body');
-
-        var contentType = res.headers.get('content-type') || '';
-        var boundaryMatch = /boundary=("?)([^;"]+)\1/i.exec(contentType);
-        var boundary = boundaryMatch ? boundaryMatch[2] : 'boundarydonotcross';
-        var boundaryBytes = new TextEncoder().encode('--' + boundary);
-
+        var res = await fetch('/stream', { signal: video.abort.signal, cache: 'no-store' });
+        if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+        var boundaryMatch = /boundary="?([^;"]+)"?/i.exec(res.headers.get('content-type') || '');
+        var boundary = new TextEncoder().encode('--' + (boundaryMatch ? boundaryMatch[1] : 'boundarydonotcross'));
         var reader = res.body.getReader();
         var buffer = new Uint8Array(0);
 
-        while (!state.stopped) {
-          var chunkResult = await reader.read();
-          if (chunkResult.done) break;
-          buffer = concatBytes(buffer, chunkResult.value);
+        while (!video.stopped) {
+          var chunk = await reader.read();
+          if (chunk.done) break;
+          buffer = concatBytes(buffer, chunk.value);
 
-          var progress = true;
-          while (progress) {
-            progress = false;
-            var boundaryIndex = indexOfBytes(buffer, boundaryBytes, 0);
-            if (boundaryIndex === -1) break;
-
-            var headerStart = boundaryIndex + boundaryBytes.length;
-            var headerEnd = indexOfBytes(buffer, DOUBLE_CRLF, headerStart);
-            if (headerEnd === -1) break; // headers not fully buffered yet
-
-            var headerText = new TextDecoder().decode(buffer.slice(headerStart, headerEnd));
-            var lengthMatch = /Content-Length:\s*(\d+)/i.exec(headerText);
-            if (!lengthMatch) {
-              // Malformed/unexpected part; skip past these headers and resync.
-              buffer = buffer.slice(headerEnd + 4);
-              progress = true;
-              continue;
-            }
-
-            var frameLength = parseInt(lengthMatch[1], 10);
-            var frameStart = headerEnd + 4;
-            var frameEnd = frameStart + frameLength;
-            if (buffer.length < frameEnd) break; // frame not fully buffered yet
-
-            var frameBytes = buffer.slice(frameStart, frameEnd);
-            buffer = buffer.slice(frameEnd);
-            progress = true;
-
-            try {
-              var bitmap = await createImageBitmap(new Blob([frameBytes], { type: 'image/jpeg' }));
-              if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-                canvas.width = bitmap.width;
-                canvas.height = bitmap.height;
-              }
-              ctx.drawImage(bitmap, 0, 0);
-              bitmap.close();
-              if (videoHandle.useRequestFrame) {
-                videoHandle.track.requestFrame();
-              }
-            } catch (drawErr) {
-              // Corrupt/partial JPEG frame - drop it and keep going.
-            }
+          // Newest frame only, so a slow client drops frames instead of lagging.
+          var newest = null;
+          var part;
+          while ((part = nextPart(buffer, boundary))) {
+            if (part.jpeg) newest = part.jpeg;
+            buffer = buffer.subarray(part.end);
           }
-
-          // Far behind (slow decode, paused tab): keep only from the latest boundary.
-          if (buffer.length > 5 * 1024 * 1024) {
-            var recentBoundary = indexOfBytes(buffer, boundaryBytes, buffer.length - 1024 * 1024);
-            buffer = recentBoundary === -1 ? new Uint8Array(0) : buffer.slice(recentBoundary);
-          }
+          if (newest) await drawFrame(newest, video);
+          if (buffer.length > MAX_STREAM_BUFFER) buffer = new Uint8Array(0);
         }
       } catch (err) {
-        if (state.stopped) return;
+        if (video.stopped) return;
         console.warn('nanokvm-pi: video stream interrupted, retrying', err);
-        await sleep(500);
       }
+      if (!video.stopped) await sleep(RETRY_MS);
     }
   }
 
-  async function createRemoteAudioTrack() {
-    var ws = new WebSocket(wsUrl('/ws/audio'));
-    ws.binaryType = 'arraybuffer';
+  function createVideoTrack(width, height) {
+    var canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    var stream = canvas.captureStream(0);
+    var track = stream.getVideoTracks()[0];
+    var requestFrame = typeof track.requestFrame === 'function';
+    if (!requestFrame) {
+      // No on-demand frames in this browser: capture at a fixed rate instead.
+      track.stop();
+      track = canvas.captureStream(30).getVideoTracks()[0];
+    }
+    var video = {
+      canvas: canvas,
+      ctx: canvas.getContext('2d', { alpha: false }),
+      track: track,
+      requestFrame: requestFrame,
+      stopped: false,
+      abort: new AbortController()
+    };
+    var stop = track.stop.bind(track);
+    track.stop = function () {
+      video.stopped = true;
+      video.abort.abort();
+      stop();
+    };
+    pumpMjpeg(video);
+    return track;
+  }
 
-    await new Promise(function (resolve, reject) {
-      ws.addEventListener('open', function onOpen() { resolve(); }, { once: true });
-      ws.addEventListener('error', function onError() {
-        reject(domException('NetworkError', 'failed to reach the NanoKVM-Pi bridge (/ws/audio)'));
-      }, { once: true });
-      ws.addEventListener('close', function onClose() {
-        reject(domException('NetworkError', 'audio websocket closed before opening (is AUDIO=on set?)'));
-      }, { once: true });
-    });
-
-    var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-    var sampleRate = 48000;
-    var channels = 2;
-    var audioCtx = new AudioContextCtor({ sampleRate: sampleRate });
-    var destination = audioCtx.createMediaStreamDestination();
-    var nextStartTime = audioCtx.currentTime + 0.08; // small jitter buffer
+  async function createAudioTrack() {
+    var ws = await openWebSocket('/ws/audio');
+    var AudioContextImpl = window.AudioContext || window.webkitAudioContext;
+    var ctx = new AudioContextImpl({ sampleRate: AUDIO_SAMPLE_RATE });
+    ctx.resume().catch(function () { /* resumes on the next user gesture */ });
+    var destination = ctx.createMediaStreamDestination();
+    var nextStart = ctx.currentTime + 0.08; // small jitter buffer
 
     ws.addEventListener('message', function (ev) {
       if (!(ev.data instanceof ArrayBuffer)) return;
       var samples = new Int16Array(ev.data);
-      var frameCount = Math.floor(samples.length / channels);
-      if (frameCount <= 0) return;
-
-      var audioBuffer = audioCtx.createBuffer(channels, frameCount, sampleRate);
-      for (var ch = 0; ch < channels; ch++) {
-        var channelData = audioBuffer.getChannelData(ch);
-        for (var i = 0; i < frameCount; i++) {
-          channelData[i] = samples[i * channels + ch] / 32768;
-        }
+      var frames = Math.floor(samples.length / AUDIO_CHANNELS);
+      if (frames === 0) return;
+      var buffer = ctx.createBuffer(AUDIO_CHANNELS, frames, AUDIO_SAMPLE_RATE);
+      for (var ch = 0; ch < AUDIO_CHANNELS; ch++) {
+        var data = buffer.getChannelData(ch);
+        for (var i = 0; i < frames; i++) data[i] = samples[i * AUDIO_CHANNELS + ch] / 32768;
       }
-
-      var source = audioCtx.createBufferSource();
-      source.buffer = audioBuffer;
+      var source = ctx.createBufferSource();
+      source.buffer = buffer;
       source.connect(destination);
-
-      var now = audioCtx.currentTime;
-      if (nextStartTime < now) nextStartTime = now + 0.02;
-      source.start(nextStartTime);
-      nextStartTime += audioBuffer.duration;
+      if (nextStart < ctx.currentTime) nextStart = ctx.currentTime + 0.02;
+      source.start(nextStart);
+      nextStart += buffer.duration;
     });
 
     var track = destination.stream.getAudioTracks()[0];
-    var originalStop = track.stop.bind(track);
+    var stop = track.stop.bind(track);
     track.stop = function () {
-      try { ws.close(); } catch (e) { /* noop */ }
-      try { audioCtx.close(); } catch (e) { /* noop */ }
-      originalStop();
+      ws.close();
+      ctx.close();
+      stop();
     };
     return track;
   }
 
-  async function fakeEnumerateDevices() {
-    var status = await fetchStatus();
+  function idealDimension(value, fallback) {
+    if (typeof value === 'number') return value;
+    if (value && typeof value.ideal === 'number') return value.ideal;
+    if (value && typeof value.exact === 'number') return value.exact;
+    return fallback;
+  }
+
+  async function enumerateDevices() {
     var devices = [
-      { deviceId: FAKE_VIDEO_ID, kind: 'videoinput', label: 'NanoKVM-USB via Pi', groupId: FAKE_GROUP_ID, toJSON: function () { return this; } }
+      { deviceId: VIDEO_DEVICE_ID, groupId: DEVICE_GROUP_ID, kind: 'videoinput', label: 'NanoKVM-USB via Pi' }
     ];
-    if (status && status.audio && status.audio.enabled) {
-      devices.push({ deviceId: FAKE_AUDIO_ID, kind: 'audioinput', label: 'NanoKVM-USB via Pi (audio)', groupId: FAKE_GROUP_ID, toJSON: function () { return this; } });
-    }
+    try {
+      var res = await fetch('/api/status', { cache: 'no-store' });
+      var status = res.ok ? await res.json() : null;
+      if (status && status.audio.enabled) {
+        devices.push({ deviceId: AUDIO_DEVICE_ID, groupId: DEVICE_GROUP_ID, kind: 'audioinput', label: 'NanoKVM-USB via Pi (audio)' });
+      }
+    } catch (e) { /* bridge unreachable - offer video only */ }
     return devices;
   }
 
-  async function fakeGetUserMedia(constraints) {
+  async function getUserMedia(constraints) {
     constraints = constraints || {};
-    var wantsVideo = !!constraints.video;
-    var wantsAudio = !!constraints.audio;
-
-    if (!wantsVideo) {
+    if (!constraints.video) {
       // Audio alone is only a permission probe; real audio comes with video.
-      throw domException('NotAllowedError', 'NanoKVM-Pi only supports video(+audio) capture, not audio-only');
+      throw domException('NotAllowedError', 'audio-only capture is not supported');
     }
-
-    var width = 1920;
-    var height = 1080;
-    if (constraints.video && constraints.video.width && constraints.video.width.ideal) {
-      width = constraints.video.width.ideal;
-    }
-    if (constraints.video && constraints.video.height && constraints.video.height.ideal) {
-      height = constraints.video.height.ideal;
-    }
+    var width = idealDimension(constraints.video.width, 1920);
+    var height = idealDimension(constraints.video.height, 1080);
 
     try {
       await fetch('/api/video', {
@@ -326,211 +292,143 @@
         body: JSON.stringify({ width: width, height: height })
       });
     } catch (e) {
-      console.warn('nanokvm-pi: failed to request resolution change', e);
+      console.warn('nanokvm-pi: could not set the capture resolution', e);
     }
 
-    var canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    var ctx = canvas.getContext('2d', { alpha: false });
-
-    var videoHandle = createCanvasVideoTrack(canvas);
-    var state = { stopped: false, abortController: new AbortController() };
-    pumpMjpeg(canvas, ctx, videoHandle, state);
-
-    var originalStop = videoHandle.track.stop.bind(videoHandle.track);
-    videoHandle.track.stop = function () {
-      state.stopped = true;
-      try { state.abortController.abort(); } catch (e) { /* noop */ }
-      originalStop();
-    };
-
-    var outStream = new MediaStream();
-    outStream.addTrack(videoHandle.track);
-
-    if (wantsAudio) {
+    var stream = new MediaStream([createVideoTrack(width, height)]);
+    if (constraints.audio) {
       try {
-        var audioTrack = await createRemoteAudioTrack();
-        outStream.addTrack(audioTrack);
+        stream.addTrack(await createAudioTrack());
       } catch (e) {
         console.warn('nanokvm-pi: audio unavailable, continuing with video only', e);
       }
     }
-
-    return outStream;
+    return stream;
   }
-
-  var fakeMediaDevices = {
-    enumerateDevices: fakeEnumerateDevices,
-    getUserMedia: fakeGetUserMedia
-  };
 
   // navigator.permissions: camera/microphone always "granted"
 
   function installPermissionsShim() {
-    var originalPermissions = navigator.permissions;
-    if (!originalPermissions || typeof originalPermissions.query !== 'function') return;
-
-    var originalQuery = originalPermissions.query.bind(originalPermissions);
-    var wrappedQuery = function (descriptor) {
-      var name = descriptor && descriptor.name;
-      if (name === 'camera' || name === 'microphone') {
-        return Promise.resolve({ state: 'granted', onchange: null, addEventListener: function () {}, removeEventListener: function () {} });
+    var permissions = navigator.permissions;
+    if (!permissions || typeof permissions.query !== 'function') return;
+    var query = permissions.query.bind(permissions);
+    Object.defineProperty(permissions, 'query', {
+      configurable: true,
+      writable: true,
+      value: function (descriptor) {
+        var name = descriptor && descriptor.name;
+        if (name === 'camera' || name === 'microphone') {
+          return Promise.resolve({ name: name, state: 'granted', onchange: null });
+        }
+        return query(descriptor);
       }
-      return originalQuery(descriptor);
-    };
-
-    try {
-      Object.defineProperty(originalPermissions, 'query', { value: wrappedQuery, writable: true, configurable: true });
-    } catch (e) {
-      console.warn('nanokvm-pi: could not shim navigator.permissions.query', e);
-    }
+    });
   }
 
   // Update banner
 
-  var DISMISS_KEY_PREFIX = 'nanokvm-pi-update-dismissed-';
-
-  function dismissedFor(version) {
-    try {
-      return sessionStorage.getItem(DISMISS_KEY_PREFIX + version) === '1';
-    } catch (e) {
-      return false;
-    }
+  function styled(tag, css, text) {
+    var el = document.createElement(tag);
+    el.setAttribute('style', css.join(';'));
+    if (text) el.textContent = text;
+    return el;
   }
 
-  function markDismissed(version) {
-    try {
-      sessionStorage.setItem(DISMISS_KEY_PREFIX + version, '1');
-    } catch (e) { /* private browsing etc. - banner just reappears next load */ }
+  function dismissKey(version) {
+    return 'nanokvm-pi-update-dismissed-' + version;
   }
 
-  function buildUpdateBanner(versionInfo) {
-    var host = window.location.host;
+  function showUpdateBanner(info) {
+    var banner = styled('div', [
+      'position:fixed', 'top:12px', 'right:12px', 'z-index:2147483647', 'max-width:360px',
+      'background:#1f1f1f', 'color:#f0f0f0', 'border:1px solid #434343', 'border-radius:8px',
+      'padding:12px 14px', 'box-shadow:0 4px 16px rgba(0,0,0,0.4)',
+      'font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif'
+    ]);
 
-    var banner = document.createElement('div');
-    banner.setAttribute('style', [
-      'position:fixed', 'top:12px', 'right:12px', 'z-index:2147483647',
-      'max-width:360px', 'background:#1f1f1f', 'color:#f0f0f0',
-      'border:1px solid #434343', 'border-radius:8px', 'padding:12px 14px',
-      'font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
-      'box-shadow:0 4px 16px rgba(0,0,0,0.4)'
-    ].join(';'));
-
-    var closeBtn = document.createElement('button');
-    closeBtn.textContent = String.fromCharCode(215); // "x"
-    closeBtn.setAttribute('style', [
-      'position:absolute', 'top:6px', 'right:8px', 'background:none',
-      'border:none', 'color:#999', 'font-size:14px', 'cursor:pointer', 'padding:2px 4px'
-    ].join(';'));
-    closeBtn.onclick = function () {
-      markDismissed(versionInfo.latest);
+    var close = styled('button', [
+      'position:absolute', 'top:6px', 'right:8px', 'background:none', 'border:none',
+      'color:#999', 'font-size:14px', 'cursor:pointer', 'padding:2px 4px'
+    ], '\u00d7');
+    close.setAttribute('aria-label', 'Dismiss');
+    close.onclick = function () {
+      try { sessionStorage.setItem(dismissKey(info.latest), '1'); } catch (e) { /* storage blocked */ }
       banner.remove();
     };
-    banner.appendChild(closeBtn);
 
-    var title = document.createElement('div');
-    title.style.paddingRight = '16px';
-    title.style.marginBottom = '8px';
-    title.textContent = 'NanoKVM-USB update available: v' + versionInfo.latest +
-      ' (installed: v' + versionInfo.installed + ')';
-    banner.appendChild(title);
+    var title = styled('div', ['padding-right:16px', 'margin-bottom:8px'],
+      'NanoKVM-USB update available: v' + info.latest + ' (installed: v' + info.installed + ')');
 
-    var updateBtn = document.createElement('button');
-    updateBtn.textContent = 'Update now';
-    updateBtn.setAttribute('style', [
+    var status = styled('div', ['margin-top:6px', 'color:#ff9c6e']);
+
+    var update = styled('button', [
       'background:#1668dc', 'color:#fff', 'border:none', 'border-radius:4px',
       'padding:5px 12px', 'cursor:pointer', 'font-size:13px', 'margin-right:8px'
-    ].join(';'));
-
-    var statusLine = document.createElement('div');
-    statusLine.style.marginTop = '6px';
-    statusLine.style.color = '#ff9c6e';
-
-    updateBtn.onclick = function () {
-      updateBtn.disabled = true;
-      updateBtn.textContent = 'Updating...';
-      statusLine.textContent = '';
-      fetch('/api/update', { method: 'POST' })
-        .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, body: body }; }); })
-        .then(function (result) {
-          if (result.ok && result.body && result.body.ok) {
-            statusLine.style.color = '#95de64';
-            statusLine.textContent = 'Updated to v' + result.body.version + '. Reloading...';
-            setTimeout(function () { window.location.reload(); }, 800);
-          } else {
-            throw new Error((result.body && result.body.error) || 'update failed');
-          }
-        })
-        .catch(function (err) {
-          updateBtn.disabled = false;
-          updateBtn.textContent = 'Update now';
-          statusLine.textContent = 'Update failed: ' + err.message;
-        });
+    ], 'Update now');
+    update.onclick = async function () {
+      update.disabled = true;
+      update.textContent = 'Updating...';
+      status.textContent = '';
+      try {
+        var res = await fetch('/api/update', { method: 'POST' });
+        var body = await res.json().catch(function () { return {}; });
+        if (!res.ok || !body.ok) throw new Error(body.error || 'HTTP ' + res.status);
+        status.style.color = '#95de64';
+        status.textContent = 'Updated to v' + body.version + '. Reloading...';
+        setTimeout(function () { location.reload(); }, 800);
+      } catch (err) {
+        update.disabled = false;
+        update.textContent = 'Update now';
+        status.textContent = 'Update failed: ' + err.message;
+      }
     };
-    banner.appendChild(updateBtn);
 
-    var toggleBtn = document.createElement('button');
-    toggleBtn.textContent = 'Show manual steps';
-    toggleBtn.setAttribute('style', [
+    var manual = styled('pre', [
+      'display:none', 'white-space:pre-wrap', 'background:#141414', 'border-radius:4px',
+      'padding:8px', 'margin:8px 0 0', 'font-size:12px', 'color:#d9d9d9', 'user-select:all'
+    ], '# In place, same as "Update now":\n' +
+       'curl -X POST ' + location.origin + '/api/update\n\n' +
+       '# Or pin it in the image: set NANOKVM_USB_VERSION to ' + info.latest + '\n' +
+       '# in docker-compose.yml, then: docker compose up -d --build');
+
+    var toggle = styled('button', [
       'background:none', 'color:#91caff', 'border:none', 'cursor:pointer',
       'font-size:13px', 'text-decoration:underline', 'padding:5px 0'
-    ].join(';'));
-
-    var manualBlock = document.createElement('pre');
-    manualBlock.setAttribute('style', [
-      'display:none', 'white-space:pre-wrap', 'background:#141414',
-      'border-radius:4px', 'padding:8px', 'margin-top:8px', 'font-size:12px',
-      'color:#d9d9d9', 'user-select:all'
-    ].join(';'));
-    manualBlock.textContent =
-      '# In place (same as "Update now" above):\n' +
-      'curl -X POST http://' + host + '/api/update\n\n' +
-      '# Or rebuild from a pinned version:\n' +
-      '# 1. edit NANOKVM_USB_VERSION in docker-compose.yml\n' +
-      '# 2. docker compose up -d --build';
-
-    toggleBtn.onclick = function () {
-      var showing = manualBlock.style.display !== 'none';
-      manualBlock.style.display = showing ? 'none' : 'block';
-      toggleBtn.textContent = showing ? 'Show manual steps' : 'Hide manual steps';
+    ], 'Show manual steps');
+    toggle.onclick = function () {
+      var hidden = manual.style.display === 'none';
+      manual.style.display = hidden ? 'block' : 'none';
+      toggle.textContent = hidden ? 'Hide manual steps' : 'Show manual steps';
     };
 
-    banner.appendChild(toggleBtn);
-    banner.appendChild(manualBlock);
-    banner.appendChild(statusLine);
-    return banner;
+    [close, title, update, toggle, manual, status].forEach(function (el) { banner.appendChild(el); });
+    document.body.appendChild(banner);
   }
 
-  function checkForUpdateAndMaybeShowBanner() {
-    fetch('/api/version', { cache: 'no-store' })
-      .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (info) {
-        if (!info || !info.update_available) return;
-        if (dismissedFor(info.latest)) return;
-        document.body.appendChild(buildUpdateBanner(info));
-      })
-      .catch(function () { /* old bridge, offline, etc. - no banner, no noise */ });
+  async function checkForUpdate() {
+    try {
+      var res = await fetch('/api/version', { cache: 'no-store' });
+      var info = res.ok ? await res.json() : null;
+      if (!info || !info.update_available) return;
+      try {
+        if (sessionStorage.getItem(dismissKey(info.latest))) return;
+      } catch (e) { /* storage blocked - show it anyway */ }
+      showUpdateBanner(info);
+    } catch (e) { /* bridge unreachable - no banner */ }
   }
 
   // Install
 
-  function defineOwnProperty(target, name, value) {
-    try {
-      Object.defineProperty(target, name, { value: value, configurable: true, writable: true });
-    } catch (e) {
-      console.error('nanokvm-pi: failed to install shim for navigator.' + name, e);
-    }
+  function override(name, value) {
+    Object.defineProperty(navigator, name, { configurable: true, writable: true, value: value });
   }
 
-  defineOwnProperty(navigator, 'serial', fakeSerial);
-  defineOwnProperty(navigator, 'mediaDevices', fakeMediaDevices);
+  override('serial', remoteSerial);
+  override('mediaDevices', { enumerateDevices: enumerateDevices, getUserMedia: getUserMedia });
   installPermissionsShim();
 
-  // Wait for the DOM and let the app start its own handshake first.
+  // Let the app start its own device handshake before asking about updates.
   window.addEventListener('DOMContentLoaded', function () {
-    setTimeout(checkForUpdateAndMaybeShowBanner, 1000);
+    setTimeout(checkForUpdate, 1000);
   });
-
-  console.info('nanokvm-pi: shim installed (serial + mediaDevices + permissions)');
 })();

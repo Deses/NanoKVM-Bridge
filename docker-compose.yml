@@ -14,7 +14,7 @@ services:
 
     volumes:
       - /dev:/dev
-      - nanokvm_www:/data
+      - nanokvm_data:/data
 
     device_cgroup_rules:
       - "c 81:* rmw"
@@ -25,17 +25,14 @@ services:
     environment:
       VIDEO_RESOLUTION: "1920x1080"
       VIDEO_FPS: "30"
-      SERIAL_BAUD: "57600"
       AUDIO: "off"
-      # VIDEO_DEVICE: /dev/video0
-      # SERIAL_DEVICE: /dev/ttyACM0
-      # AUDIO_DEVICE: hw:1
-      # USTREAMER_EXTRA_ARGS: "--encoder=m2m-image"
       # AUTH_USER: admin
       # AUTH_PASSWORD: change-me
 
-      # UPDATE_CHECK: "off"
-      # UPDATE_CHECK_INTERVAL: "21600"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
-  nanokvm_www:
+  nanokvm_data:
