@@ -64,6 +64,8 @@ All via environment variables in `docker-compose.yml`:
 | `USTREAMER_EXTRA_ARGS` | *(empty)* | Extra flags appended to the ustreamer command, e.g. a hardware encoder |
 | `AUDIO` | `off` | Set to `on` to enable audio (see below) |
 | `AUDIO_DEVICE` | auto-detect | ALSA device, e.g. `hw:1` |
+| `UPDATE_CHECK` | `on` | Set to `off` to stop checking Sipeed's releases for updates |
+| `UPDATE_CHECK_INTERVAL` | `21600` (6h) | How often to check, in seconds |
 | `AUTH_USER` / `AUTH_PASSWORD` | unset | HTTP basic auth in front of everything, if set |
 
 Auto-detection looks at `/dev/serial/by-id/*` and `/dev/v4l/by-id/*` first
@@ -96,6 +98,48 @@ it, and it needs `/dev/snd` access. To enable it:
 2. Rebuild/restart. The app's video device dropdown will then also offer a
    matching audio input, exactly like it would with a directly-attached
    dongle.
+
+## Keeping the frontend up to date
+
+Sipeed's browser build isn't vendored in this repo - the image downloads it
+straight from their GitHub releases (`NANOKVM_USB_VERSION` in
+`docker-compose.yml`, currently `1.1.4`). The running container also checks
+for a newer release on its own (every `UPDATE_CHECK_INTERVAL`, `UPDATE_CHECK:
+"off"` to disable) and, when one exists, shows a small banner in the app with
+an **"Update now"** button - no rebuild needed. That button downloads the new
+release, drops it into the container's `/data/www` volume in place, and
+reloads the page.
+
+Doing it manually is the same thing, minus the click:
+
+```bash
+curl -X POST http://<pi-ip>:47812/api/update
+# or, pinned to a specific version:
+curl -X POST http://<pi-ip>:47812/api/update -H 'Content-Type: application/json' -d '{"version":"1.1.5"}'
+```
+
+`GET /api/version` reports what's currently installed and what the checker
+last saw. Both endpoints sit behind the same `auth_basic` as the rest of the
+site, if `AUTH_USER`/`AUTH_PASSWORD` are set.
+
+The old path - bump `NANOKVM_USB_VERSION` in `docker-compose.yml`, then
+`docker compose up -d --build` - still works, and is what a completely fresh
+deploy uses. One wrinkle now that `/data/www` is a named volume: it survives
+a plain rebuild (that's the point - your in-place updates aren't wiped by
+`up -d --build`), so bumping the pinned version alone won't change anything
+once the volume has already been updated at least once. To force it back to
+whatever's baked into the image, remove the volume first:
+
+```bash
+docker compose down
+docker volume rm nanokvm-pi_nanokvm_www   # name may differ - check `docker volume ls`
+docker compose up -d --build
+```
+
+This only ever fetches Sipeed's official zip over HTTPS from github.com -
+same trust boundary as the build-time download, no new supply chain surface.
+Sipeed doesn't publish checksums for these releases, so neither path verifies
+one; that's unchanged from before.
 
 ## Reverse proxy
 

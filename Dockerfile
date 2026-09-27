@@ -12,7 +12,8 @@ RUN curl -fsSL -o browser.zip \
       "https://github.com/sipeed/NanoKVM-USB/releases/download/v${NANOKVM_USB_VERSION}/nanokvm-usb-browser-v${NANOKVM_USB_VERSION}.zip" && \
     mkdir -p /www && \
     unzip -q browser.zip -d /www && \
-    rm browser.zip
+    rm browser.zip && \
+    echo -n "${NANOKVM_USB_VERSION}" > /www/.nanokvm-usb-version
 
 # Classic script, so the shim runs before the app's module bundle.
 COPY web/nanokvm-pi-shim.js /www/nanokvm-pi-shim.js
@@ -36,11 +37,15 @@ RUN apt-get update && \
       tini \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=fetch /www /www
+# Baked-in build; entrypoint.sh seeds the /data volume from it on first boot.
+COPY --from=fetch /www /www-image
 
 COPY nginx/nginx.conf.template /etc/nginx/nginx.conf.template
 COPY server/bridge.py /app/bridge.py
+COPY server/updater.py /app/updater.py
 COPY dev/fake_mjpeg.py /app/fake_mjpeg.py
+# Reference copy of the shim, injected into downloaded releases.
+COPY web/nanokvm-pi-shim.js /app/nanokvm-pi-shim.js
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

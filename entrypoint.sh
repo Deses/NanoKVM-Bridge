@@ -2,6 +2,13 @@
 # Renders the nginx config, then runs the bridge and nginx; either exiting stops the container.
 set -e
 
+# Seed only an empty volume, so in-app updates survive rebuilds.
+if [ ! -f /data/www/index.html ]; then
+    echo "[entrypoint] seeding /data/www from the image's baked-in build"
+    mkdir -p /data/www
+    cp -a /www-image/. /data/www/
+fi
+
 cp /etc/nginx/nginx.conf.template /etc/nginx/nginx.conf
 
 if [ -n "${AUTH_USER:-}" ] && [ -n "${AUTH_PASSWORD:-}" ]; then

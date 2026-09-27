@@ -14,6 +14,8 @@ import time
 
 from aiohttp import web, WSMsgType
 
+import updater
+
 logging.basicConfig(level=logging.INFO, format="[bridge] %(message)s")
 LOG = logging.getLogger("nanokvm-pi-bridge")
 
@@ -409,15 +411,39 @@ async def api_video(request):
     return web.json_response({"ok": True})
 
 
+async def api_version(request):
+    upd = request.app["updater"]
+    upd.maybe_refresh()
+    return web.json_response(upd.status())
+
+
+async def api_update(request):
+    upd = request.app["updater"]
+    version = None
+    if request.can_read_body:
+        try:
+            body = await request.json()
+            version = body.get("version") if body else None
+        except Exception:  # noqa: BLE001 - empty/non-JSON body means "use latest"
+            version = None
+    try:
+        installed = await upd.perform_update(version)
+    except Exception as exc:  # noqa: BLE001 - reported to the caller, not fatal
+        return web.json_response({"error": str(exc)}, status=409)
+    return web.json_response({"ok": True, "version": installed})
+
+
 async def on_startup(app):
     app["streamer"].start()
     app["streamer_task"] = asyncio.create_task(app["streamer"].watchdog())
+    app["updater_task"] = asyncio.create_task(app["updater"].watchdog())
 
 
 async def on_cleanup(app):
-    task = app.get("streamer_task")
-    if task:
-        task.cancel()
+    for key in ("streamer_task", "updater_task"):
+        task = app.get(key)
+        if task:
+            task.cancel()
     app["streamer"].stop()
     app["serial_bridge"]._close()  # noqa: SLF001 - internal, shutdown path only
     app["audio_bridge"]._stop()  # noqa: SLF001
@@ -428,11 +454,14 @@ def create_app():
     app["serial_bridge"] = SerialBridge()
     app["audio_bridge"] = AudioBridge()
     app["streamer"] = Streamer()
+    app["updater"] = updater.Updater()
 
     app.router.add_get("/ws/serial", ws_serial_handler)
     app.router.add_get("/ws/audio", ws_audio_handler)
     app.router.add_get("/api/status", api_status)
     app.router.add_post("/api/video", api_video)
+    app.router.add_get("/api/version", api_version)
+    app.router.add_post("/api/update", api_update)
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)

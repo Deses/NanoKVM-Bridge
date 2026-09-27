@@ -13,6 +13,7 @@ services:
 
     volumes:
       - /dev:/dev
+      - nanokvm_www:/data
 
     device_cgroup_rules:
       - "c 81:* rmw"
@@ -31,3 +32,9 @@ services:
       # USTREAMER_EXTRA_ARGS: "--encoder=m2m-image"
       # AUTH_USER: admin
       # AUTH_PASSWORD: change-me
+
+      # UPDATE_CHECK: "off"
+      # UPDATE_CHECK_INTERVAL: "21600"
+
+volumes:
+  nanokvm_www:

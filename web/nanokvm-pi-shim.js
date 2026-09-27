@@ -387,6 +387,132 @@
     }
   }
 
+  // Update banner
+
+  var DISMISS_KEY_PREFIX = 'nanokvm-pi-update-dismissed-';
+
+  function dismissedFor(version) {
+    try {
+      return sessionStorage.getItem(DISMISS_KEY_PREFIX + version) === '1';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function markDismissed(version) {
+    try {
+      sessionStorage.setItem(DISMISS_KEY_PREFIX + version, '1');
+    } catch (e) { /* private browsing etc. - banner just reappears next load */ }
+  }
+
+  function buildUpdateBanner(versionInfo) {
+    var host = window.location.host;
+
+    var banner = document.createElement('div');
+    banner.setAttribute('style', [
+      'position:fixed', 'top:12px', 'right:12px', 'z-index:2147483647',
+      'max-width:360px', 'background:#1f1f1f', 'color:#f0f0f0',
+      'border:1px solid #434343', 'border-radius:8px', 'padding:12px 14px',
+      'font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+      'box-shadow:0 4px 16px rgba(0,0,0,0.4)'
+    ].join(';'));
+
+    var closeBtn = document.createElement('button');
+    closeBtn.textContent = String.fromCharCode(215); // "x"
+    closeBtn.setAttribute('style', [
+      'position:absolute', 'top:6px', 'right:8px', 'background:none',
+      'border:none', 'color:#999', 'font-size:14px', 'cursor:pointer', 'padding:2px 4px'
+    ].join(';'));
+    closeBtn.onclick = function () {
+      markDismissed(versionInfo.latest);
+      banner.remove();
+    };
+    banner.appendChild(closeBtn);
+
+    var title = document.createElement('div');
+    title.style.paddingRight = '16px';
+    title.style.marginBottom = '8px';
+    title.textContent = 'NanoKVM-USB update available: v' + versionInfo.latest +
+      ' (installed: v' + versionInfo.installed + ')';
+    banner.appendChild(title);
+
+    var updateBtn = document.createElement('button');
+    updateBtn.textContent = 'Update now';
+    updateBtn.setAttribute('style', [
+      'background:#1668dc', 'color:#fff', 'border:none', 'border-radius:4px',
+      'padding:5px 12px', 'cursor:pointer', 'font-size:13px', 'margin-right:8px'
+    ].join(';'));
+
+    var statusLine = document.createElement('div');
+    statusLine.style.marginTop = '6px';
+    statusLine.style.color = '#ff9c6e';
+
+    updateBtn.onclick = function () {
+      updateBtn.disabled = true;
+      updateBtn.textContent = 'Updating...';
+      statusLine.textContent = '';
+      fetch('/api/update', { method: 'POST' })
+        .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, body: body }; }); })
+        .then(function (result) {
+          if (result.ok && result.body && result.body.ok) {
+            statusLine.style.color = '#95de64';
+            statusLine.textContent = 'Updated to v' + result.body.version + '. Reloading...';
+            setTimeout(function () { window.location.reload(); }, 800);
+          } else {
+            throw new Error((result.body && result.body.error) || 'update failed');
+          }
+        })
+        .catch(function (err) {
+          updateBtn.disabled = false;
+          updateBtn.textContent = 'Update now';
+          statusLine.textContent = 'Update failed: ' + err.message;
+        });
+    };
+    banner.appendChild(updateBtn);
+
+    var toggleBtn = document.createElement('button');
+    toggleBtn.textContent = 'Show manual steps';
+    toggleBtn.setAttribute('style', [
+      'background:none', 'color:#91caff', 'border:none', 'cursor:pointer',
+      'font-size:13px', 'text-decoration:underline', 'padding:5px 0'
+    ].join(';'));
+
+    var manualBlock = document.createElement('pre');
+    manualBlock.setAttribute('style', [
+      'display:none', 'white-space:pre-wrap', 'background:#141414',
+      'border-radius:4px', 'padding:8px', 'margin-top:8px', 'font-size:12px',
+      'color:#d9d9d9', 'user-select:all'
+    ].join(';'));
+    manualBlock.textContent =
+      '# In place (same as "Update now" above):\n' +
+      'curl -X POST http://' + host + '/api/update\n\n' +
+      '# Or rebuild from a pinned version:\n' +
+      '# 1. edit NANOKVM_USB_VERSION in docker-compose.yml\n' +
+      '# 2. docker compose up -d --build';
+
+    toggleBtn.onclick = function () {
+      var showing = manualBlock.style.display !== 'none';
+      manualBlock.style.display = showing ? 'none' : 'block';
+      toggleBtn.textContent = showing ? 'Show manual steps' : 'Hide manual steps';
+    };
+
+    banner.appendChild(toggleBtn);
+    banner.appendChild(manualBlock);
+    banner.appendChild(statusLine);
+    return banner;
+  }
+
+  function checkForUpdateAndMaybeShowBanner() {
+    fetch('/api/version', { cache: 'no-store' })
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (info) {
+        if (!info || !info.update_available) return;
+        if (dismissedFor(info.latest)) return;
+        document.body.appendChild(buildUpdateBanner(info));
+      })
+      .catch(function () { /* old bridge, offline, etc. - no banner, no noise */ });
+  }
+
   // Install
 
   function defineOwnProperty(target, name, value) {
@@ -400,6 +526,11 @@
   defineOwnProperty(navigator, 'serial', fakeSerial);
   defineOwnProperty(navigator, 'mediaDevices', fakeMediaDevices);
   installPermissionsShim();
+
+  // Wait for the DOM and let the app start its own handshake first.
+  window.addEventListener('DOMContentLoaded', function () {
+    setTimeout(checkForUpdateAndMaybeShowBanner, 1000);
+  });
 
   console.info('nanokvm-pi: shim installed (serial + mediaDevices + permissions)');
 })();
