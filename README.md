@@ -31,8 +31,9 @@ port.
 
 ## Setup
 
-1. Connect the NanoKVM-USB's **HOST** port to a USB 3.0 port on the Pi, and its
-   HDMI and target USB ports to the machine you want to control.
+1. Connect the NanoKVM-USB's **HOST** port to a USB port on the Pi (3.0 if it
+   has one), and its HDMI and target USB ports to the machine you want to
+   control.
 2. Check the Pi sees it:
    ```bash
    ls -l /dev/serial/by-id/ /dev/v4l/by-id/
@@ -167,6 +168,9 @@ docker exec -d nanokvm-pi-test python3 /app/fake_mjpeg.py
 Open `http://localhost:47812` and pick the video device. `docker stop
 nanokvm-pi-test` when done. Keyboard and mouse need the real dongle; audio can
 be faked with `AUDIO=on` and `AUDIO_DEVICE=test` (a 440 Hz tone).
+
+For a full automated run with a fake serial port and a fake GitHub as well,
+see `dev/run_e2e.sh`.
 
 ## Alternatives
 
