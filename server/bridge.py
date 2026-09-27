@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Bridges the NanoKVM-USB app to the dongle, behind nginx."""
+"""Serves the NanoKVM-USB app and bridges it to the dongle."""
 
 import asyncio
+import base64
 import glob
+import hmac
 import logging
 import math
 import os
@@ -12,15 +14,17 @@ import subprocess
 import threading
 import time
 
+import aiohttp
 from aiohttp import web, WSMsgType
 
 import updater
+from updater import WWW_DIR
 
 logging.basicConfig(level=logging.INFO, format="[bridge] %(message)s")
 LOG = logging.getLogger("nanokvm-pi-bridge")
 
-BRIDGE_HOST = "127.0.0.1"
-BRIDGE_PORT = 8090
+BRIDGE_HOST = "0.0.0.0"
+BRIDGE_PORT = 80
 STREAM_PORT = 8081
 
 SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "57600"))
@@ -29,6 +33,9 @@ USTREAMER_EXTRA_ARGS = shlex.split(os.environ.get("USTREAMER_EXTRA_ARGS", ""))
 AUDIO_ENABLED = os.environ.get("AUDIO", "off").strip().lower() in ("1", "true", "on", "yes")
 AUDIO_RATE = 48000
 AUDIO_CHANNELS = 2
+
+AUTH_USER = os.environ.get("AUTH_USER")
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD")
 
 
 # Re-resolved on every (re)connect, so a replugged dongle is found again.
@@ -359,6 +366,80 @@ class AudioBridge:
                 self.clients.discard(ws)
 
 
+@web.middleware
+async def basic_auth_middleware(request, handler):
+    if not AUTH_USER or not AUTH_PASSWORD:
+        return await handler(request)
+
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(header[6:]).decode("utf-8")
+            user, _, password = decoded.partition(":")
+        except Exception:  # noqa: BLE001 - malformed header, fall through to 401
+            user = password = None
+        if user is not None and hmac.compare_digest(user, AUTH_USER) and hmac.compare_digest(
+            password, AUTH_PASSWORD
+        ):
+            return await handler(request)
+
+    return web.Response(
+        status=401,
+        headers={"WWW-Authenticate": 'Basic realm="NanoKVM-Pi"'},
+        text="Unauthorized",
+    )
+
+
+@web.middleware
+async def hide_dotfiles_middleware(request, handler):
+    # Dotfiles (e.g. .nanokvm-usb-version) are never served.
+    if any(part.startswith(".") for part in request.path.split("/") if part):
+        raise web.HTTPNotFound()
+    return await handler(request)
+
+
+async def add_security_headers(request, response):
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+
+async def index_handler(request):
+    index_path = os.path.join(WWW_DIR, "index.html")
+    if not os.path.isfile(index_path):
+        raise web.HTTPServiceUnavailable(text="frontend not seeded yet")
+    return web.FileResponse(index_path)
+
+
+async def stream_handler(request):
+    streamer = request.app["streamer"]
+    if not streamer.enabled:
+        raise web.HTTPServiceUnavailable(text="no video device configured")
+
+    session = request.app["http_client"]
+    try:
+        upstream = await session.get(
+            f"http://127.0.0.1:{STREAM_PORT}/stream",
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=5),
+        )
+    except Exception as exc:  # noqa: BLE001 - ustreamer not up yet/crashed
+        raise web.HTTPBadGateway(text=f"video stream unavailable: {exc}")
+
+    response = web.StreamResponse(
+        status=upstream.status,
+        headers={"Content-Type": upstream.headers.get("Content-Type", "multipart/x-mixed-replace")},
+    )
+    # Unbuffered, so latency doesn't build up.
+    await response.prepare(request)
+    try:
+        async for chunk in upstream.content.iter_any():
+            await response.write(chunk)
+    except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientConnectionError):
+        pass
+    finally:
+        upstream.close()
+    return response
+
+
 async def ws_serial_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -434,6 +515,7 @@ async def api_update(request):
 
 
 async def on_startup(app):
+    app["http_client"] = aiohttp.ClientSession()
     app["streamer"].start()
     app["streamer_task"] = asyncio.create_task(app["streamer"].watchdog())
     app["updater_task"] = asyncio.create_task(app["updater"].watchdog())
@@ -444,25 +526,31 @@ async def on_cleanup(app):
         task = app.get(key)
         if task:
             task.cancel()
+    await app["http_client"].close()
     app["streamer"].stop()
     app["serial_bridge"]._close()  # noqa: SLF001 - internal, shutdown path only
     app["audio_bridge"]._stop()  # noqa: SLF001
 
 
 def create_app():
-    app = web.Application()
+    app = web.Application(middlewares=[basic_auth_middleware, hide_dotfiles_middleware])
     app["serial_bridge"] = SerialBridge()
     app["audio_bridge"] = AudioBridge()
     app["streamer"] = Streamer()
     app["updater"] = updater.Updater()
 
+    # Static route last: it matches every path.
+    app.router.add_get("/", index_handler)
+    app.router.add_get("/stream", stream_handler)
     app.router.add_get("/ws/serial", ws_serial_handler)
     app.router.add_get("/ws/audio", ws_audio_handler)
     app.router.add_get("/api/status", api_status)
     app.router.add_post("/api/video", api_video)
     app.router.add_get("/api/version", api_version)
     app.router.add_post("/api/update", api_update)
+    app.router.add_static("/", WWW_DIR, show_index=False)
 
+    app.on_response_prepare.append(add_security_headers)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
@@ -470,6 +558,7 @@ def create_app():
 
 def main():
     LOG.info("audio %s", "enabled" if AUDIO_ENABLED else "disabled")
+    LOG.info("auth %s", f"enabled (user '{AUTH_USER}')" if AUTH_USER and AUTH_PASSWORD else "disabled")
     web.run_app(create_app(), host=BRIDGE_HOST, port=BRIDGE_PORT, print=None)
 
 

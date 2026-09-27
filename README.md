@@ -29,8 +29,11 @@ a WebSocket/HTTP bridge running on the Pi:
 - **Audio** (optional, off by default): raw PCM from the dongle's USB audio
   input travels over a second WebSocket and plays back on your side.
 
-Everything is served through nginx on a single port, so you can point a
-reverse proxy at it like any other web app.
+Everything is served by a single Python process (`server/bridge.py`, using
+aiohttp) on one port - it serves the static frontend files, proxies
+ustreamer's video, speaks the WebSocket protocols above, and answers the
+`/api/*` endpoints below. There's no nginx or other second process in the
+container; you can still point a reverse proxy at it like any other web app.
 
 ## Setup
 
@@ -47,8 +50,10 @@ container hands out full keyboard and mouse control of the target machine -
 see **Security** below.)
 
 Building on the Pi itself works fine: every package this image needs
-(`ustreamer`, `nginx-light`, `python3-aiohttp`, ...) is available for both
-`arm64` and `armhf` in Debian, so there's no cross-compilation involved.
+(`ustreamer`, `python3-aiohttp`, ...) is available for both `arm64` and
+`armhf` in Debian, so there's no cross-compilation involved. The image is
+~190MB - no nginx, no dev/diagnostic tooling baked in (see **Testing without
+hardware** for how to get those back temporarily when you actually need them).
 
 ## Configuration
 
@@ -68,6 +73,10 @@ All via environment variables in `docker-compose.yml`:
 | `UPDATE_CHECK_INTERVAL` | `21600` (6h) | How often to check, in seconds |
 | `AUTH_USER` / `AUTH_PASSWORD` | unset | HTTP basic auth in front of everything, if set |
 
+`WITH_AUDIO` is a **build arg**, not a runtime env var (`docker-compose.yml`'s
+`build.args`) - it controls whether `alsa-utils` is installed at all. See
+**Audio** below.
+
 Auto-detection looks at `/dev/serial/by-id/*` and `/dev/v4l/by-id/*` first
 (stable names tied to the USB device), falling back to `/dev/ttyACM0` /
 `/dev/video0`. If you have other USB serial/video devices on the same Pi,
@@ -77,8 +86,19 @@ Find the right values with:
 
 ```bash
 ls -l /dev/serial/by-id/ /dev/v4l/by-id/
-v4l2-ctl -d /dev/video0 --list-formats-ext   # confirm it offers MJPEG
 ```
+
+`v4l2-ctl` (to double-check a capture card actually offers MJPEG) isn't
+bundled in the image to keep it small - install it on-demand in a running
+container if you need it:
+
+```bash
+docker exec nanokvm-pi bash -c "apt-get update -qq && apt-get install -y --no-install-recommends v4l-utils" \
+  && docker exec nanokvm-pi v4l2-ctl -d /dev/video0 --list-formats-ext
+```
+
+That install doesn't survive a container restart - which is the point, it's
+a one-off diagnostic, not something every deployment should carry.
 
 `GET /api/status` (behind auth, if enabled) reports what the bridge
 currently sees for troubleshooting:
@@ -89,15 +109,18 @@ curl http://<pi-ip>:47812/api/status
 
 ### Audio
 
-Off by default, since most people diagnosing a headless server don't need
-it, and it needs `/dev/snd` access. To enable it:
+Off by default - most people diagnosing a headless server don't need it, and
+it costs a build-time package (`alsa-utils`) plus `/dev/snd` access that
+isn't worth carrying otherwise. To enable it:
 
-1. In `docker-compose.yml`, set `AUDIO: "on"` and uncomment the `c 116:* rmw`
+1. In `docker-compose.yml`, set `build.args.WITH_AUDIO: "true"` (installs
+   `alsa-utils`), `environment.AUDIO: "on"`, and uncomment the `c 116:* rmw`
    device cgroup rule (and optionally `AUDIO_DEVICE` if auto-detection picks
    the wrong ALSA card - check with `cat /proc/asound/cards`).
-2. Rebuild/restart. The app's video device dropdown will then also offer a
-   matching audio input, exactly like it would with a directly-attached
-   dongle.
+2. `docker compose up -d --build` (the build arg means a real rebuild, not
+   just a restart, the first time you flip it on). The app's video device
+   dropdown will then also offer a matching audio input, exactly like it
+   would with a directly-attached dongle.
 
 ## Keeping the frontend up to date
 
@@ -119,8 +142,8 @@ curl -X POST http://<pi-ip>:47812/api/update -H 'Content-Type: application/json'
 ```
 
 `GET /api/version` reports what's currently installed and what the checker
-last saw. Both endpoints sit behind the same `auth_basic` as the rest of the
-site, if `AUTH_USER`/`AUTH_PASSWORD` are set.
+last saw. Both endpoints go through the same HTTP Basic auth check as
+everything else, if `AUTH_USER`/`AUTH_PASSWORD` are set.
 
 The old path - bump `NANOKVM_USB_VERSION` in `docker-compose.yml`, then
 `docker compose up -d --build` - still works, and is what a completely fresh
@@ -186,10 +209,12 @@ expose this beyond your LAN.
 
 `dev/fake_mjpeg.py` stands in for both the dongle's video and ustreamer, so
 you can sanity-check the container, the bridge, and the shim without the
-dongle plugged in:
+dongle plugged in. It needs Pillow, which isn't in the image by default
+(it's a dev-only dependency) - install it in the running container first:
 
 ```bash
 docker compose run --rm -e VIDEO_DEVICE=none -p 47812:80 nanokvm-pi &
+docker exec nanokvm-pi bash -c "apt-get update -qq && apt-get install -y --no-install-recommends python3-pil"
 docker exec -it nanokvm-pi python3 /app/fake_mjpeg.py &
 ```
 
@@ -207,7 +232,7 @@ official NanoKVM-USB one.
 
 ## Status
 
-This is a first pass, built and tested against a fake serial/video device
-(no physical NanoKVM-USB available). It hasn't yet been run against
-real hardware - expect to find and fix a few rough edges on first boot with
-the actual dongle.
+Confirmed working on real hardware: a NanoKVM-USB (CH9329-style serial +
+MACROSILICON MS21xx capture chip) plugged into a Raspberry Pi 4/5 running
+DietPi - video, keyboard, and mouse all working end to end through a browser
+on a different machine.

@@ -4,6 +4,7 @@ services:
       context: .
       args:
         NANOKVM_USB_VERSION: "1.1.4"
+        WITH_AUDIO: "false"
     image: nanokvm-pi:latest
     container_name: nanokvm-pi
     restart: unless-stopped
