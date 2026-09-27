@@ -41,8 +41,9 @@ port.
 4. Open `http://<pi-ip>:47812`, pick the "NanoKVM-USB via Pi" video device,
    then click "Select serial device".
 
-Everything the image needs is packaged by Debian for `arm64` and `armhf`, so
-it builds natively on the Pi.
+The image is based on Alpine Linux (about 90MB). ustreamer isn't packaged for
+Alpine, so the build compiles a pinned release from source; that takes a
+minute or two on a Pi. Everything else comes from Alpine's packages.
 
 ## Configuration
 
@@ -60,13 +61,14 @@ Environment variables in `docker-compose.yml`:
 | `AUDIO_DEVICE` | auto | ALSA device, e.g. `plughw:1`. |
 | `AUTH_USER`, `AUTH_PASSWORD` | | Require HTTP Basic auth for everything when both are set. |
 | `UPDATE_CHECK` | `on` | `off` to stop checking for new NanoKVM-USB releases. |
-| `UPDATE_CHECK_INTERVAL` | `21600` | Seconds between update checks. |
+| `UPDATE_CHECK_INTERVAL` | `21600` | Seconds between update checks (minimum 60). |
 
 Build args, under `build.args`:
 
 | Arg | Default | |
 | --- | --- | --- |
 | `NANOKVM_USB_VERSION` | `1.1.4` | NanoKVM-USB browser release baked into the image. |
+| `USTREAMER_VERSION`, `USTREAMER_COMMIT` | `6.67`, its commit | ustreamer release to build. The build checks the tag still points at that commit, so change both together. |
 | `WITH_AUDIO` | `false` | Install `alsa-utils`, needed for audio. |
 
 Auto-detection uses the first entry in `/dev/serial/by-id/` and the first
@@ -85,7 +87,7 @@ curl http://<pi-ip>:47812/api/status
 it temporarily (it's gone after the next container restart):
 
 ```bash
-docker exec nanokvm-pi bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends v4l-utils"
+docker exec nanokvm-pi apk add --no-cache v4l-utils
 docker exec nanokvm-pi v4l2-ctl -d /dev/video0 --list-formats-ext
 ```
 
@@ -158,7 +160,7 @@ Stop the main container first (the test one uses the same port), then:
 
 ```bash
 docker compose run -d --rm --name nanokvm-pi-test -p 47812:80 -e VIDEO_DEVICE=none nanokvm-pi
-docker exec nanokvm-pi-test bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends python3-pil"
+docker exec nanokvm-pi-test apk add --no-cache py3-pillow
 docker exec -d nanokvm-pi-test python3 /app/fake_mjpeg.py
 ```
 

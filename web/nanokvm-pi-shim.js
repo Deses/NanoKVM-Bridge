@@ -147,6 +147,10 @@
     } catch (e) {
       return; // corrupt frame
     }
+    if (video.stopped) {
+      bitmap.close();
+      return;
+    }
     if (video.canvas.width !== bitmap.width || video.canvas.height !== bitmap.height) {
       video.canvas.width = bitmap.width;
       video.canvas.height = bitmap.height;
@@ -249,7 +253,7 @@
     var stop = track.stop.bind(track);
     track.stop = function () {
       ws.close();
-      ctx.close();
+      ctx.close().catch(function () { /* already closed */ });
       stop();
     };
     return track;
@@ -310,19 +314,21 @@
 
   function installPermissionsShim() {
     var permissions = navigator.permissions;
-    if (!permissions || typeof permissions.query !== 'function') return;
-    var query = permissions.query.bind(permissions);
-    Object.defineProperty(permissions, 'query', {
-      configurable: true,
-      writable: true,
-      value: function (descriptor) {
-        var name = descriptor && descriptor.name;
-        if (name === 'camera' || name === 'microphone') {
-          return Promise.resolve({ name: name, state: 'granted', onchange: null });
-        }
-        return query(descriptor);
+    var query = permissions && typeof permissions.query === 'function'
+      ? permissions.query.bind(permissions)
+      : function () { return Promise.reject(new TypeError('permissions API unavailable')); };
+    var wrapped = function (descriptor) {
+      var name = descriptor && descriptor.name;
+      if (name === 'camera' || name === 'microphone') {
+        return Promise.resolve({ name: name, state: 'granted', onchange: null });
       }
-    });
+      return query(descriptor);
+    };
+    if (permissions) {
+      Object.defineProperty(permissions, 'query', { configurable: true, writable: true, value: wrapped });
+    } else {
+      override('permissions', { query: wrapped });
+    }
   }
 
   // Update banner

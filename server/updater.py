@@ -4,6 +4,7 @@ Installs are built next to it and swapped in by rename, so a failure never touch
 """
 
 import asyncio
+import glob
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import zipfile
 
 LOG = logging.getLogger("nanokvm-pi.updater")
 
+BAKED_DIR = "/www-image"
 DATA_DIR = "/data"
 WWW_DIR = os.path.join(DATA_DIR, "www")
 VERSION_FILE = ".nanokvm-usb-version"
@@ -35,7 +37,7 @@ DOWNLOAD_URL_TEMPLATE = os.environ.get(
 REQUEST_HEADERS = {"User-Agent": "nanokvm-pi"}
 
 CHECK_ENABLED = os.environ.get("UPDATE_CHECK", "on").strip().lower() not in ("0", "off", "false", "no")
-CHECK_INTERVAL = int(os.environ.get("UPDATE_CHECK_INTERVAL", str(6 * 3600)))
+CHECK_INTERVAL = max(60, int(os.environ.get("UPDATE_CHECK_INTERVAL", str(6 * 3600))))
 RETRY_INTERVAL = min(CHECK_INTERVAL, 600)  # e.g. no network yet at boot
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
@@ -51,23 +53,68 @@ def parse_version(version):
     return tuple(int(part) for part in version.split("."))
 
 
-def installed_version():
+def read_version(directory):
     try:
-        with open(os.path.join(WWW_DIR, VERSION_FILE)) as f:
+        with open(os.path.join(directory, VERSION_FILE)) as f:
             return f.read().strip() or None
     except OSError:
         return None
 
 
-def inject_shim_tag(index_path):
+def installed_version():
+    return read_version(WWW_DIR)
+
+
+def install_baked():
+    """Install the image's build unless the volume already has it or newer."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    _clean_up_interrupted_install()
+
+    baked = read_version(BAKED_DIR)
+    installed = parse_version(installed_version())
+    if os.path.isfile(os.path.join(WWW_DIR, "index.html")) and installed and installed >= parse_version(baked):
+        return
+
+    LOG.info("installing NanoKVM-USB frontend v%s", baked)
+    with tempfile.TemporaryDirectory(dir=DATA_DIR, prefix=".update-") as tmp:
+        new_dir = os.path.join(tmp, "www")
+        shutil.copytree(BAKED_DIR, new_dir)
+        _prepare(new_dir, baked)
+        _swap_in(new_dir)
+
+
+def _clean_up_interrupted_install():
+    for leftover in glob.glob(os.path.join(DATA_DIR, ".update-*")):
+        shutil.rmtree(leftover, ignore_errors=True)
+    old_dir = WWW_DIR + ".old"
+    if not os.path.isfile(os.path.join(WWW_DIR, "index.html")) and os.path.isfile(os.path.join(old_dir, "index.html")):
+        shutil.rmtree(WWW_DIR, ignore_errors=True)
+        os.rename(old_dir, WWW_DIR)
+    shutil.rmtree(old_dir, ignore_errors=True)
+
+
+def _prepare(new_dir, version):
+    index_path = os.path.join(new_dir, "index.html")
+    if not os.path.isfile(index_path):
+        raise UpdateError("no index.html - not the NanoKVM-USB browser build?")
     with open(index_path) as f:
         html = f.read()
-    if SHIM_TAG in html:
-        return
-    if "<head>" not in html:
-        raise UpdateError("unexpected index.html: no <head> to inject the shim into")
-    with open(index_path, "w") as f:
-        f.write(html.replace("<head>", "<head>\n    " + SHIM_TAG, 1))
+    if SHIM_TAG not in html:
+        if "<head>" not in html:
+            raise UpdateError("unexpected index.html: no <head> to load the shim from")
+        with open(index_path, "w") as f:
+            f.write(html.replace("<head>", "<head>\n    " + SHIM_TAG, 1))
+    with open(os.path.join(new_dir, VERSION_FILE), "w") as f:
+        f.write(version)
+
+
+def _swap_in(new_dir):
+    old_dir = WWW_DIR + ".old"
+    shutil.rmtree(old_dir, ignore_errors=True)
+    if os.path.isdir(WWW_DIR):
+        os.rename(WWW_DIR, old_dir)
+    os.rename(new_dir, WWW_DIR)
+    shutil.rmtree(old_dir, ignore_errors=True)
 
 
 class Updater:
@@ -103,7 +150,7 @@ class Updater:
     async def check_latest(self):
         try:
             latest = await asyncio.to_thread(self._fetch_latest_version)
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError, TypeError) as exc:
             self.last_check_error = str(exc)
             LOG.warning("update check failed: %s", exc)
             return False
@@ -133,7 +180,7 @@ class Updater:
         self.updating = True
         self.last_update_error = None
         try:
-            await asyncio.to_thread(self._download_and_swap, version)
+            await asyncio.to_thread(self._download_and_install, version)
         except UpdateError as exc:
             self.last_update_error = str(exc)
             raise
@@ -145,7 +192,7 @@ class Updater:
         LOG.info("installed NanoKVM-USB frontend v%s", version)
         return version
 
-    def _download_and_swap(self, version):
+    def _download_and_install(self, version):
         url = DOWNLOAD_URL_TEMPLATE.format(version=version)
         LOG.info("downloading %s", url)
         with tempfile.TemporaryDirectory(dir=DATA_DIR, prefix=".update-") as tmp:
@@ -156,20 +203,8 @@ class Updater:
                     shutil.copyfileobj(resp, f)
             except urllib.error.HTTPError as exc:
                 raise UpdateError(f"download failed (HTTP {exc.code}) - is v{version} a release?") from exc
-
             new_dir = os.path.join(tmp, "www")
             with zipfile.ZipFile(zip_path) as zf:
                 zf.extractall(new_dir)
-            index_path = os.path.join(new_dir, "index.html")
-            if not os.path.isfile(index_path):
-                raise UpdateError("archive has no index.html - not the browser build?")
-            inject_shim_tag(index_path)
-            with open(os.path.join(new_dir, VERSION_FILE), "w") as f:
-                f.write(version)
-
-            old_dir = WWW_DIR + ".old"
-            shutil.rmtree(old_dir, ignore_errors=True)
-            if os.path.isdir(WWW_DIR):
-                os.rename(WWW_DIR, old_dir)
-            os.rename(new_dir, WWW_DIR)
-            shutil.rmtree(old_dir, ignore_errors=True)
+            _prepare(new_dir, version)
+            _swap_in(new_dir)

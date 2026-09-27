@@ -80,13 +80,19 @@ def resolve_audio_device():
     return None
 
 
+def valid_resolution(width, height):
+    return 1 <= width <= 7680 and 1 <= height <= 4320
+
+
 def parse_resolution(value):
     try:
-        width, height = value.lower().split("x")
-        return int(width), int(height)
+        width, height = (int(part) for part in value.lower().split("x"))
     except ValueError:
+        width = height = 0
+    if not valid_resolution(width, height):
         LOG.warning("invalid VIDEO_RESOLUTION %r, using 1920x1080", value)
         return 1920, 1080
+    return width, height
 
 
 async def broadcast(clients, data):
@@ -280,7 +286,7 @@ class Streamer:
 class AudioBridge:
     def __init__(self):
         self.clients = set()
-        self.device = resolve_audio_device() if AUDIO_ENABLED else None
+        self.device = None
         self._stop = None
         self._thread = None
         self._loop = None
@@ -310,6 +316,8 @@ class AudioBridge:
             self._stop = self._thread = None
 
     def _start(self):
+        # Per session: the card number can change on replug.
+        self.device = resolve_audio_device()
         if not self.device:
             LOG.warning("AUDIO=on but no USB audio capture device found")
             return
@@ -348,6 +356,7 @@ class AudioBridge:
     def _tone_loop(self, stop):
         samples = AUDIO_RATE // 50  # 20ms
         index = 0
+        deadline = time.monotonic()
         while not stop.is_set():
             buf = bytearray()
             for _ in range(samples):
@@ -355,7 +364,16 @@ class AudioBridge:
                 buf += struct.pack("<hh", value, value)
                 index += 1
             self._send(bytes(buf))
-            time.sleep(0.02)
+            deadline += 0.02
+            time.sleep(max(0.0, deadline - time.monotonic()))
+
+
+SERIAL = web.AppKey("serial", SerialBridge)
+AUDIO = web.AppKey("audio", AudioBridge)
+STREAMER = web.AppKey("streamer", Streamer)
+UPDATER = web.AppKey("updater", updater.Updater)
+HTTP_CLIENT = web.AppKey("http_client", aiohttp.ClientSession)
+TASKS = web.AppKey("tasks", list)
 
 
 def _credentials_match(header):
@@ -410,7 +428,7 @@ async def shim_handler(request):
 
 async def stream_handler(request):
     try:
-        upstream = await request.app["http_client"].get(
+        upstream = await request.app[HTTP_CLIENT].get(
             f"http://127.0.0.1:{STREAM_PORT}/stream",
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=5),
         )
@@ -435,7 +453,7 @@ async def stream_handler(request):
 async def ws_serial_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    bridge = request.app["serial"]
+    bridge = request.app[SERIAL]
     await bridge.add_client(ws)
     try:
         async for msg in ws:
@@ -452,7 +470,7 @@ async def ws_audio_handler(request):
     if not AUDIO_ENABLED:
         await ws.close(message=b"audio disabled")
         return ws
-    bridge = request.app["audio"]
+    bridge = request.app[AUDIO]
     await bridge.add_client(ws)
     try:
         async for _ in ws:
@@ -464,9 +482,9 @@ async def ws_audio_handler(request):
 
 async def api_status(request):
     return web.json_response({
-        "serial": request.app["serial"].status(),
-        "video": request.app["streamer"].status(),
-        "audio": request.app["audio"].status(),
+        "serial": request.app[SERIAL].status(),
+        "video": request.app[STREAMER].status(),
+        "audio": request.app[AUDIO].status(),
     })
 
 
@@ -476,14 +494,14 @@ async def api_video(request):
         width, height = int(body["width"]), int(body["height"])
     except (ValueError, KeyError, TypeError):
         raise web.HTTPBadRequest(text='expected JSON {"width": int, "height": int}')
-    if not (1 <= width <= 7680 and 1 <= height <= 4320):
+    if not valid_resolution(width, height):
         raise web.HTTPBadRequest(text="resolution out of range")
-    await request.app["streamer"].set_resolution(width, height)
+    await request.app[STREAMER].set_resolution(width, height)
     return web.json_response({"ok": True})
 
 
 async def api_version(request):
-    return web.json_response(request.app["updater"].status())
+    return web.json_response(request.app[UPDATER].status())
 
 
 async def api_update(request):
@@ -497,41 +515,42 @@ async def api_update(request):
             raise web.HTTPBadRequest(text='expected JSON {"version": "x.y.z"}')
         version = body.get("version")
     try:
-        installed = await request.app["updater"].perform_update(version)
+        installed = await request.app[UPDATER].perform_update(version)
     except updater.UpdateError as exc:
         return web.json_response({"error": str(exc)}, status=409)
     return web.json_response({"ok": True, "version": installed})
 
 
 async def on_startup(app):
-    app["http_client"] = aiohttp.ClientSession()
-    app["tasks"] = [
-        asyncio.create_task(app["streamer"].supervise()),
-        asyncio.create_task(app["updater"].run()),
+    app[HTTP_CLIENT] = aiohttp.ClientSession()
+    app[TASKS] = [
+        asyncio.create_task(app[STREAMER].supervise()),
+        asyncio.create_task(app[UPDATER].run()),
     ]
 
 
 async def on_shutdown(app):
-    # WebSocket handlers never return on their own; close them so `docker stop` doesn't SIGKILL.
-    for ws in list(app["serial"].clients) + list(app["audio"].clients):
+    # WebSocket and /stream handlers never return on their own; end them so
+    # `docker stop` doesn't SIGKILL. Closing the session ends every /stream proxy.
+    for ws in list(app[SERIAL].clients) + list(app[AUDIO].clients):
         await ws.close(code=aiohttp.WSCloseCode.GOING_AWAY, message=b"shutting down")
+    await app[HTTP_CLIENT].close()
 
 
 async def on_cleanup(app):
-    for task in app["tasks"]:
+    for task in app[TASKS]:
         task.cancel()
-    await app["http_client"].close()
-    await app["streamer"].stop()
-    app["serial"].close()
-    app["audio"].stop()
+    await app[STREAMER].stop()
+    app[SERIAL].close()
+    app[AUDIO].stop()
 
 
 def create_app():
     app = web.Application(middlewares=[auth_middleware, hide_dotfiles_middleware])
-    app["serial"] = SerialBridge()
-    app["audio"] = AudioBridge()
-    app["streamer"] = Streamer()
-    app["updater"] = updater.Updater()
+    app[SERIAL] = SerialBridge()
+    app[AUDIO] = AudioBridge()
+    app[STREAMER] = Streamer()
+    app[UPDATER] = updater.Updater()
 
     # Static route last: it matches every path.
     app.router.add_get("/", index_handler)
@@ -553,10 +572,10 @@ def create_app():
 
 
 def main():
+    updater.install_baked()
     LOG.info("audio %s, auth %s",
              "on" if AUDIO_ENABLED else "off",
              f"on (user {AUTH_USER!r})" if AUTH_ENABLED else "off")
-    # A short shutdown_timeout cancels still-open /stream proxies promptly.
     web.run_app(create_app(), port=HTTP_PORT, shutdown_timeout=3, print=None)
 
 
