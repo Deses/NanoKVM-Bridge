@@ -33,6 +33,8 @@ One Python process (`server/bridge.py`, aiohttp) serves all of it on a single po
 
 The image is based on Alpine Linux and weighs about 90MB.
 
+`latest` is built from `main`. To try the development branch, put `IMAGE_TAG=dev` in a `.env` file next to `docker-compose.yml` and pull again. Remove it to go back to `latest`.
+
 ## Configuration
 
 Environment variables in `docker-compose.yml`:
@@ -62,6 +64,8 @@ Build args, under `build.args`:
 Auto-detection picks the first entry in `/dev/serial/by-id/` and the first `*-video-index0` entry in `/dev/v4l/by-id/`, and falls back to `/dev/ttyACM0`, `/dev/ttyUSB0` and `/dev/video0`. If the host has other USB serial or video devices attached, set the device variables explicitly.
 A dongle plugged in after the container starts is picked up automatically.
 
+Several people can watch at once, but there's only one video stream. The first viewer's resolution wins: a resolution change from another page is ignored until that page is the only one watching.
+
 To see what the bridge found:
 
 ```bash
@@ -85,6 +89,13 @@ Audio is off by default. To turn it on, edit `docker-compose.yml`:
 3. Run `docker compose up -d --build`. The published image is built without audio, so this needs a local build.
 
 The app then offers the dongle's audio next to its video. If it picks the wrong sound card, set `AUDIO_DEVICE` (see `cat /proc/asound/cards`).
+
+### Phones and tablets
+
+On a touch screen there's no way to open the phone's keyboard over a video, so a keyboard button appears in the bottom right corner. It opens the phone's own keyboard plus a bar with the keys phones lack: Esc, Tab, Ctrl, Alt, Win, arrows and Del.
+Ctrl, Alt and Win stay pressed until the next key, so Ctrl then C sends Ctrl+C, and Ctrl, Alt, Del sends Ctrl+Alt+Del.
+
+A USB keyboard sends key positions, not characters, and the target turns them into characters with its own layout. So pick the target's layout with the layout button in the bar (it shows the current one, `en-US` at first), or characters like `ñ` and `@` will come out wrong. What matters is the keyboard layout set on the target's operating system, not the phone's keyboard language or the target's locale. The choice is saved on the bridge, so every phone uses it. Supported layouts are Chinese, English (UK and US), French, German, Italian, Japanese, Korean, Portuguese (Brazil and Portugal), Russian and Spanish (Latin America and Spain); see [web/layouts](web/layouts/README.md) for their codes and for how to add one. Characters the layout doesn't have are skipped.
 
 ## Updating the NanoKVM-USB frontend
 

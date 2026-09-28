@@ -3,8 +3,10 @@
 
 import asyncio
 import base64
+import collections
 import glob
 import hmac
+import json
 import logging
 import math
 import os
@@ -26,6 +28,7 @@ LOG = logging.getLogger("nanokvm-bridge")
 HTTP_PORT = 80
 STREAM_PORT = 8081
 SHIM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nanokvm-bridge-shim.js")
+LAYOUTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layouts")
 NO_CACHE_PATHS = {"/", "/index.html", "/nanokvm-bridge-shim.js"}
 
 SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "57600"))
@@ -378,6 +381,10 @@ STREAMER = web.AppKey("streamer", Streamer)
 UPDATER = web.AppKey("updater", updater.Updater)
 HTTP_CLIENT = web.AppKey("http_client", aiohttp.ClientSession)
 TASKS = web.AppKey("tasks", list)
+# Open /stream responses per page (the shim sends a random id), so one
+# viewer can't change the resolution under another.
+VIEWERS = web.AppKey("viewers", collections.Counter)
+LAYOUTS = web.AppKey("layouts", dict)
 
 
 def _credentials_match(header):
@@ -439,6 +446,9 @@ async def stream_handler(request):
     except aiohttp.ClientError as exc:
         raise web.HTTPServiceUnavailable(text=f"video stream unavailable: {exc}")
 
+    viewers = request.app[VIEWERS]
+    client = request.query.get("client", "")
+    viewers[client] += 1
     try:
         response = web.StreamResponse(
             status=upstream.status,
@@ -451,6 +461,9 @@ async def stream_handler(request):
         pass  # viewer left or ustreamer restarted; the shim reconnects
     finally:
         upstream.close()
+        viewers[client] -= 1
+        if viewers[client] <= 0:
+            del viewers[client]
     return response
 
 
@@ -497,6 +510,7 @@ async def api_status(request):
         "serial": request.app[SERIAL].status(),
         "video": request.app[STREAMER].status(),
         "audio": request.app[AUDIO].status(),
+        "keyboard": {"layout": read_layout(request.app[LAYOUTS]), "layouts": request.app[LAYOUTS]},
     })
 
 
@@ -508,8 +522,52 @@ async def api_video(request):
         raise web.HTTPBadRequest(text='expected JSON {"width": int, "height": int}')
     if not valid_resolution(width, height):
         raise web.HTTPBadRequest(text="resolution out of range")
-    await request.app[STREAMER].set_resolution(width, height)
-    return web.json_response({"ok": True})
+    streamer = request.app[STREAMER]
+    client = body.get("client") or ""
+    if any(viewer != client for viewer in request.app[VIEWERS]):
+        LOG.info("ignoring %dx%d: another viewer is watching at %dx%d", width, height, streamer.width, streamer.height)
+        return web.json_response({"ok": True, "applied": False, "resolution": f"{streamer.width}x{streamer.height}"})
+    await streamer.set_resolution(width, height)
+    return web.json_response({"ok": True, "applied": True, "resolution": f"{width}x{height}"})
+
+
+def available_layouts():
+    layouts = {}
+    for path in sorted(glob.glob(os.path.join(LAYOUTS_DIR, "*.json"))):
+        with open(path, encoding="utf-8") as f:
+            layouts[os.path.basename(path)[:-len(".json")]] = json.load(f)["name"]
+    return layouts
+
+
+def layout_file():
+    return os.path.join(updater.DATA_DIR, "keyboard-layout")
+
+
+# The target's keyboard layout, for the phone keyboard. Chosen from the page,
+# kept in the /data volume.
+def read_layout(layouts):
+    try:
+        with open(layout_file(), encoding="utf-8") as f:
+            name = f.read().strip()
+    except OSError:
+        return "en-US"
+    return name if name in layouts else "en-US"
+
+
+async def api_keyboard(request):
+    try:
+        body = await request.json()
+        name = body["layout"]
+    except (ValueError, KeyError, TypeError):
+        raise web.HTTPBadRequest(text='expected JSON {"layout": "xx-XX"}')
+    if name not in request.app[LAYOUTS]:
+        raise web.HTTPBadRequest(text="unknown layout")
+    tmp = layout_file() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(name)
+    os.replace(tmp, layout_file())
+    LOG.info("keyboard layout set to %s", name)
+    return web.json_response({"ok": True, "layout": name})
 
 
 async def api_version(request):
@@ -563,6 +621,8 @@ def create_app():
     app[AUDIO] = AudioBridge()
     app[STREAMER] = Streamer()
     app[UPDATER] = updater.Updater()
+    app[VIEWERS] = collections.Counter()
+    app[LAYOUTS] = available_layouts()
 
     # Static route last: it matches every path.
     app.router.add_get("/", index_handler)
@@ -574,6 +634,8 @@ def create_app():
     app.router.add_post("/api/video", api_video)
     app.router.add_get("/api/version", api_version)
     app.router.add_post("/api/update", api_update)
+    app.router.add_post("/api/keyboard", api_keyboard)
+    app.router.add_static("/layouts", LAYOUTS_DIR)
     app.router.add_static("/", updater.WWW_DIR)
 
     app.on_response_prepare.append(add_response_headers)

@@ -5,7 +5,7 @@ services:
       args:
         NANOKVM_USB_VERSION: "1.1.4"
         WITH_AUDIO: "false"
-    image: ghcr.io/deses/nanokvm-bridge:latest
+    image: ghcr.io/deses/nanokvm-bridge:${IMAGE_TAG:-latest}
     container_name: nanokvm-bridge
     restart: unless-stopped
 
@@ -28,11 +28,6 @@ services:
       AUDIO: "off"
       # AUTH_USER: admin
       # AUTH_PASSWORD: change-me
-
-    logging:
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 volumes:
   nanokvm_data:

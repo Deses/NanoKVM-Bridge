@@ -1,0 +1,26 @@
+{
+  "name": "English",
+  "extends": "en-US",
+  "keys": {
+    "¬": "S+Backquote",
+    "¦": "G+Backquote",
+    "\"": "S+Digit2",
+    "£": "S+Digit3",
+    "€": "G+Digit4",
+    "@": "S+Quote",
+    "#": "Backslash",
+    "~": "S+Backslash",
+    "\\": "IntlBackslash",
+    "|": "S+IntlBackslash",
+    "á": "G+KeyA",
+    "Á": "S+G+KeyA",
+    "é": "G+KeyE",
+    "É": "S+G+KeyE",
+    "í": "G+KeyI",
+    "Í": "S+G+KeyI",
+    "ó": "G+KeyO",
+    "Ó": "S+G+KeyO",
+    "ú": "G+KeyU",
+    "Ú": "S+G+KeyU"
+  }
+}
