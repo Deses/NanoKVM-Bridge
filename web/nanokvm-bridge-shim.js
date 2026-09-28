@@ -639,8 +639,9 @@
     });
 
     var bar = styled('div', [
-      'position:fixed', 'left:0', 'right:0', 'bottom:0', 'z-index:2147483646', 'display:none',
-      'flex-wrap:wrap', 'gap:4px', 'padding:4px', 'background:#1f1f1f', 'border-top:1px solid #434343'
+      'position:fixed', 'left:0', 'top:0', 'z-index:2147483646', 'display:none', 'box-sizing:border-box',
+      'flex-wrap:wrap', 'gap:4px', 'padding:4px', 'background:#1f1f1f', 'border-top:1px solid #434343',
+      'transform-origin:0 0'
     ]);
 
     function barButton(label, onPress) {
@@ -673,9 +674,9 @@
     barButton('\u00d7', function () { input.blur(); });
 
     var open = styled('button', [
-      'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483646', 'width:48px', 'height:48px',
+      'position:fixed', 'left:0', 'top:0', 'z-index:2147483646', 'width:48px', 'height:48px',
       'border-radius:24px', 'background:#1668dc', 'color:#fff', 'border:none', 'font-size:22px',
-      'box-shadow:0 2px 8px rgba(0,0,0,0.5)'
+      'box-shadow:0 2px 8px rgba(0,0,0,0.5)', 'transform-origin:0 0'
     ], '\u2328');
     open.setAttribute('aria-label', 'Keyboard');
     open.addEventListener('click', function () {
@@ -683,33 +684,49 @@
       input.focus({ preventScroll: true });
     });
 
-    // Sit on top of the phone's keyboard, which shrinks the visual viewport.
-    function placeBar() {
-      var vv = window.visualViewport;
-      bar.style.bottom = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) + 'px' : '0';
+    // Pinned to what's on screen (the visual viewport) and scaled against pinch
+    // zoom, so the controls keep their size and the textarea never pulls the
+    // view away when the browser scrolls it into sight.
+    function place() {
+      var vv = window.visualViewport || { offsetLeft: 0, offsetTop: 0, width: innerWidth, height: innerHeight, scale: 1 };
+      var k = 1 / vv.scale;
+      bar.style.width = vv.width * vv.scale + 'px';
+      bar.style.transform = 'scale(' + k + ')';
+      bar.style.left = vv.offsetLeft + 'px';
+      bar.style.top = vv.offsetTop + vv.height - bar.offsetHeight * k + 'px';
+      open.style.transform = 'scale(' + k + ')';
+      open.style.left = vv.offsetLeft + vv.width - 64 * k + 'px';
+      open.style.top = vv.offsetTop + vv.height - 64 * k + 'px';
+      input.style.left = vv.offsetLeft + 'px';
+      input.style.top = vv.offsetTop + 'px';
     }
     if (window.visualViewport) {
-      window.visualViewport.addEventListener('resize', placeBar);
-      window.visualViewport.addEventListener('scroll', placeBar);
+      window.visualViewport.addEventListener('resize', place);
+      window.visualViewport.addEventListener('scroll', place);
     }
     input.addEventListener('focus', function () {
       bar.style.display = 'flex';
       open.style.display = 'none';
-      placeBar();
+      place();
     });
     input.addEventListener('blur', function () {
       bar.style.display = 'none';
       open.style.display = '';
       takeSticky();
+      place();
     });
 
     [input, bar, open].forEach(function (el) { document.body.appendChild(el); });
+    place();
   }
 
   // The app gives the video a 640x360 minimum, which overflows a phone held upright.
   function fitSmallScreens() {
     var style = document.createElement('style');
-    style.textContent = '@media (max-width: 639px), (max-height: 359px) { #video { min-width: 0 !important; min-height: 0 !important; } }';
+    style.textContent =
+      '@media (max-width: 639px), (max-height: 359px) { #video { min-width: 0 !important; min-height: 0 !important; } }' +
+      // On phones the video sits at the top, next to the keyboard's text, instead of centered.
+      '@media (pointer: coarse) and (hover: none) { #root > div { justify-content: flex-start !important; } }';
     document.head.appendChild(style);
     // Shrink the page above the phone's keyboard instead of letting it cover the video.
     var meta = document.querySelector('meta[name="viewport"]');
