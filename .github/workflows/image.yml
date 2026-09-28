@@ -52,7 +52,8 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/386,linux/arm64,linux/arm/v7
+          # Releases (main and tags) cover every platform; dev and PRs only the 64-bit ones.
+          platforms: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && 'linux/amd64,linux/386,linux/arm64,linux/arm/v7' || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
