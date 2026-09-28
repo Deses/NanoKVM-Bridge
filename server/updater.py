@@ -5,6 +5,7 @@ Installs are built next to it and swapped in by rename, so a failure never touch
 
 import asyncio
 import glob
+import http.client
 import json
 import logging
 import os
@@ -55,7 +56,7 @@ def parse_version(version):
 
 def read_version(directory):
     try:
-        with open(os.path.join(directory, VERSION_FILE)) as f:
+        with open(os.path.join(directory, VERSION_FILE), encoding="utf-8") as f:
             return f.read().strip() or None
     except OSError:
         return None
@@ -97,14 +98,14 @@ def _prepare(new_dir, version):
     index_path = os.path.join(new_dir, "index.html")
     if not os.path.isfile(index_path):
         raise UpdateError("no index.html - not the NanoKVM-USB browser build?")
-    with open(index_path) as f:
+    with open(index_path, encoding="utf-8") as f:
         html = f.read()
     if SHIM_TAG not in html:
         if "<head>" not in html:
             raise UpdateError("unexpected index.html: no <head> to load the shim from")
-        with open(index_path, "w") as f:
+        with open(index_path, "w", encoding="utf-8") as f:
             f.write(html.replace("<head>", "<head>\n    " + SHIM_TAG, 1))
-    with open(os.path.join(new_dir, VERSION_FILE), "w") as f:
+    with open(os.path.join(new_dir, VERSION_FILE), "w", encoding="utf-8") as f:
         f.write(version)
 
 
@@ -150,7 +151,7 @@ class Updater:
     async def check_latest(self):
         try:
             latest = await asyncio.to_thread(self._fetch_latest_version)
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as exc:
             self.last_check_error = str(exc)
             LOG.warning("update check failed: %s", exc)
             return False
@@ -184,7 +185,7 @@ class Updater:
         except UpdateError as exc:
             self.last_update_error = str(exc)
             raise
-        except (OSError, zipfile.BadZipFile) as exc:
+        except (OSError, http.client.HTTPException, zipfile.BadZipFile) as exc:
             self.last_update_error = f"update to v{version} failed: {exc}"
             raise UpdateError(self.last_update_error) from exc
         finally:

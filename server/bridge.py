@@ -190,9 +190,10 @@ class SerialBridge:
         LOG.warning(self.last_error)
         self.close()
         # Closing the sockets makes the app show its device picker again.
-        for ws in list(self.clients):
+        stale = list(self.clients)
+        self.clients.difference_update(stale)
+        for ws in stale:
             await ws.close()
-        self.clients.clear()
 
 
 class Streamer:
