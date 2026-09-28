@@ -701,10 +701,12 @@
       'position:absolute', 'left:0', 'top:0', 'width:100%', 'height:100%', 'opacity:0', 'font-size:16px'
     ]);
     select.setAttribute('aria-label', 'Keyboard layout');
-    Object.keys(keyboard.layouts).forEach(function (code) {
+    Object.keys(keyboard.layouts).map(function (code) {
+      return { code: code, label: keyboard.layouts[code] + ' (' + code + ')' };
+    }).sort(function (a, b) { return a.label.localeCompare(b.label); }).forEach(function (layout) {
       var option = document.createElement('option');
-      option.value = code;
-      option.textContent = keyboard.layouts[code] + ' (' + code + ')';
+      option.value = layout.code;
+      option.textContent = layout.label;
       select.appendChild(option);
     });
     picker.appendChild(pickerLabel);

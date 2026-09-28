@@ -6,19 +6,19 @@ The layout button in the phone keyboard's bar picks one; the choice is saved on 
 
 | File | Layout |
 | --- | --- |
-| `en-US.json` | English (US) |
+| `zh-CN.json`, `zh-TW.json` | Chinese (US keys, full-width punctuation) |
 | `en-GB.json` | English (UK) |
-| `es-ES.json` | Spanish (Spain) |
-| `es-419.json` | Spanish (Latin America) |
-| `pt-BR.json` | Portuguese (Brazil, ABNT2) |
-| `pt-PT.json` | Portuguese (Portugal) |
+| `en-US.json` | English (US) |
 | `fr-FR.json` | French (France, AZERTY) |
 | `de-DE.json` | German (Germany, QWERTZ) |
 | `it-IT.json` | Italian (Italy) |
-| `ru-RU.json` | Russian (Russia, JCUKEN) |
 | `ja-JP.json` | Japanese (JIS) |
-| `zh-CN.json`, `zh-TW.json` | Chinese (US keys, full-width punctuation) |
 | `ko-KR.json` | Korean (US keys) |
+| `pt-BR.json` | Portuguese (Brazil, ABNT2) |
+| `pt-PT.json` | Portuguese (Portugal) |
+| `ru-RU.json` | Russian (Russia, JCUKEN) |
+| `es-419.json` | Spanish (Latin America) |
+| `es-ES.json` | Spanish (Spain) |
 
 Chinese, Japanese and Korean text is built on the target by its input method, from keystrokes. The phone keyboard can only send those keystrokes, not finished characters: switch the phone to a Latin keyboard, type pinyin or romaji, and let the target's input method convert them. Hangul can't be typed from the phone yet. Full-width punctuation (`，` `。` and so on) is sent as the key the target's input method turns into it.
 
