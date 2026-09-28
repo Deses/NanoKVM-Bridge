@@ -5,7 +5,7 @@ services:
       args:
         NANOKVM_USB_VERSION: "1.1.4"
         WITH_AUDIO: "false"
-    image: nanokvm-pi:latest
+    image: ghcr.io/deses/nanokvm-bridge:latest
     container_name: nanokvm-pi
     restart: unless-stopped
 

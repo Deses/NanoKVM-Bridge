@@ -38,7 +38,9 @@ port.
    ```bash
    ls -l /dev/serial/by-id/ /dev/v4l/by-id/
    ```
-3. `docker compose up -d --build`
+3. `docker compose pull && docker compose up -d` fetches the prebuilt image
+   (x86-64, 32-bit x86, arm64 and 32-bit arm) from GHCR.
+   `docker compose up -d --build` builds it locally instead.
 4. Open `http://<pi-ip>:47812`. It connects to the dongle's video and
    keyboard/mouse by itself; if it can't (say, the dongle is unplugged), the
    app's device dialog stays up with an error, and you can retry from there.
@@ -46,7 +48,8 @@ port.
 
 The image is based on Alpine Linux (about 90MB). ustreamer isn't packaged for
 Alpine, so the build compiles a pinned release from source; that takes a
-minute or two on a Pi. Everything else comes from Alpine's packages.
+few minutes on a Pi, which is why CI builds and publishes the image.
+Everything else comes from Alpine's packages.
 
 ## Configuration
 
@@ -101,7 +104,8 @@ Off by default. To enable it, in `docker-compose.yml`:
 1. Set `WITH_AUDIO: "true"` under `build.args` and `AUDIO: "on"` under
    `environment`.
 2. Uncomment the `c 116:* rmw` device cgroup rule.
-3. Run `docker compose up -d --build`.
+3. Run `docker compose up -d --build`. The published image is built without
+   audio, so this one needs a local build.
 
 The app then offers the dongle's audio alongside its video. If the wrong
 sound card is picked, set `AUDIO_DEVICE` (see `cat /proc/asound/cards`).
