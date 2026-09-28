@@ -33,6 +33,8 @@ One Python process (`server/bridge.py`, aiohttp) serves all of it on a single po
 
 The image is based on Alpine Linux and weighs about 90MB.
 
+`latest` is built from `main`. To try the development branch, put `IMAGE_TAG=dev` in a `.env` file next to `docker-compose.yml` and pull again. Remove it to go back to `latest`.
+
 ## Configuration
 
 Environment variables in `docker-compose.yml`:
