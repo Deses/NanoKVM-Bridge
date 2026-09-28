@@ -53,7 +53,10 @@ def check(path):
             errors.append(f"dead key {strokes!r}: {check_strokes(strokes)}")
         if not isinstance(accented, str) or len(accented) != 10:
             errors.append(f"dead key {strokes!r}: needs the 10 accented vowels aeiouAEIOU")
-    unknown = set(layout) - {"name", "latin", "keys", "dead"}
+    base = layout.get("extends")
+    if base is not None and not (LAYOUTS_DIR / f"{base}.json").is_file():
+        errors.append(f'"extends": no layout {base!r}')
+    unknown = set(layout) - {"name", "extends", "latin", "keys", "dead"}
     if unknown:
         errors.append(f"unknown fields: {', '.join(sorted(unknown))}")
     return errors
@@ -67,6 +70,20 @@ def main():
         for error in errors:
             print(f"{path.name}: {error}")
         failed = failed or bool(errors)
+    for path in paths:
+        seen = [path.stem]
+        while True:
+            try:
+                base = json.loads((LAYOUTS_DIR / f"{seen[-1]}.json").read_text(encoding="utf-8")).get("extends")
+            except (OSError, ValueError, AttributeError):
+                break
+            if base is None:
+                break
+            if base in seen:
+                print(f"{path.name}: extends loop {' -> '.join(seen + [base])}")
+                failed = True
+                break
+            seen.append(base)
     if "en-US.json" not in {p.name for p in paths}:
         print("en-US.json is missing; it's the fallback")
         failed = True

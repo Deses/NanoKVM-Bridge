@@ -553,10 +553,20 @@
     return table;
   }
 
+  // "extends" names a layout this one adds to; its keys and dead keys win.
   function loadLayout(name) {
     return fetch('/layouts/' + encodeURIComponent(name) + '.json', { cache: 'no-store' }).then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return res.json();
+    }).then(function (layout) {
+      if (!layout.extends) return layout;
+      return loadLayout(layout.extends).then(function (base) {
+        return {
+          latin: layout.latin !== undefined ? layout.latin : base.latin,
+          keys: Object.assign({}, base.keys, layout.keys),
+          dead: Object.assign({}, base.dead, layout.dead)
+        };
+      });
     });
   }
 
