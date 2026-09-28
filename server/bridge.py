@@ -26,6 +26,7 @@ LOG = logging.getLogger("nanokvm-bridge")
 HTTP_PORT = 80
 STREAM_PORT = 8081
 SHIM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nanokvm-bridge-shim.js")
+LAYOUTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layouts")
 NO_CACHE_PATHS = {"/", "/index.html", "/nanokvm-bridge-shim.js"}
 
 SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "57600"))
@@ -576,6 +577,7 @@ def create_app():
     app.router.add_post("/api/video", api_video)
     app.router.add_get("/api/version", api_version)
     app.router.add_post("/api/update", api_update)
+    app.router.add_static("/layouts", LAYOUTS_DIR)
     app.router.add_static("/", updater.WWW_DIR)
 
     app.on_response_prepare.append(add_response_headers)
@@ -587,6 +589,8 @@ def create_app():
 
 def main():
     updater.install_baked()
+    if not os.path.isfile(os.path.join(LAYOUTS_DIR, KEYBOARD_LAYOUT + ".json")):
+        LOG.warning("no layout file for KEYBOARD_LAYOUT %r; the phone keyboard uses en-US", KEYBOARD_LAYOUT)
     LOG.info("audio %s, auth %s",
              "on" if AUDIO_ENABLED else "off",
              f"on (user {AUTH_USER!r})" if AUTH_ENABLED else "off")

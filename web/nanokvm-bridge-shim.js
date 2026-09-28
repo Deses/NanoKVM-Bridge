@@ -527,55 +527,35 @@
   // Touch keyboard: a phone can't open its keyboard over a video, so a button
   // focuses a hidden textarea and what's typed there is replayed as key presses.
 
-  // Strokes are space-separated; "S+" holds Shift and "G+" holds AltGr.
-  function keyTable(extra) {
+  // A layout file (web/layouts/*.json) maps characters to strokes: space-separated
+  // key codes, with "S+" holding Shift and "G+" holding AltGr.
+  function buildTable(layout) {
     var table = { ' ': 'Space', '\n': 'Enter', '\t': 'Tab' };
-    for (var i = 0; i < 26; i++) {
-      var letter = String.fromCharCode(97 + i);
-      table[letter] = 'Key' + letter.toUpperCase();
-      table[letter.toUpperCase()] = 'S+Key' + letter.toUpperCase();
+    if (layout.latin !== false) {
+      for (var i = 0; i < 26; i++) {
+        var letter = String.fromCharCode(97 + i);
+        table[letter] = 'Key' + letter.toUpperCase();
+        table[letter.toUpperCase()] = 'S+Key' + letter.toUpperCase();
+      }
     }
     for (var d = 0; d < 10; d++) table[String(d)] = 'Digit' + d;
-    Object.keys(extra).forEach(function (ch) { table[ch] = extra[ch]; });
+    Object.keys(layout.keys).forEach(function (ch) { table[ch] = layout.keys[ch]; });
+    // Each accented vowel is its dead key, then the plain vowel.
+    Object.keys(layout.dead || {}).forEach(function (dead) {
+      var accented = Array.from(layout.dead[dead]);
+      Array.from('aeiouAEIOU').forEach(function (vowel, i) {
+        if (!(accented[i] in table) && table[vowel]) table[accented[i]] = dead + ' ' + table[vowel];
+      });
+    });
     return table;
   }
 
-  function deadVowels(table, deadStroke, accented) {
-    var vowels = 'aeiouAEIOU';
-    for (var i = 0; i < vowels.length; i++) {
-      table[accented[i]] = deadStroke + ' ' + (i >= 5 ? 'S+' : '') + 'Key' + vowels[i].toUpperCase();
-    }
+  function loadLayout(name) {
+    return fetch('/layouts/' + encodeURIComponent(name) + '.json', { cache: 'no-store' }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    });
   }
-
-  var LAYOUTS = {
-    'en-US': keyTable({
-      '`': 'Backquote', '~': 'S+Backquote', '!': 'S+Digit1', '@': 'S+Digit2', '#': 'S+Digit3',
-      '$': 'S+Digit4', '%': 'S+Digit5', '^': 'S+Digit6', '&': 'S+Digit7', '*': 'S+Digit8',
-      '(': 'S+Digit9', ')': 'S+Digit0', '-': 'Minus', '_': 'S+Minus', '=': 'Equal', '+': 'S+Equal',
-      '[': 'BracketLeft', '{': 'S+BracketLeft', ']': 'BracketRight', '}': 'S+BracketRight',
-      '\\': 'Backslash', '|': 'S+Backslash', ';': 'Semicolon', ':': 'S+Semicolon',
-      "'": 'Quote', '"': 'S+Quote', ',': 'Comma', '<': 'S+Comma', '.': 'Period', '>': 'S+Period',
-      '/': 'Slash', '?': 'S+Slash'
-    }),
-    'es-ES': keyTable({
-      '\u00ba': 'Backquote', '\u00aa': 'S+Backquote', '\\': 'G+Backquote',
-      '!': 'S+Digit1', '|': 'G+Digit1', '"': 'S+Digit2', '@': 'G+Digit2', '\u00b7': 'S+Digit3', '#': 'G+Digit3',
-      '$': 'S+Digit4', '~': 'G+Digit4', '%': 'S+Digit5', '\u20ac': 'G+Digit5', '&': 'S+Digit6', '\u00ac': 'G+Digit6',
-      '/': 'S+Digit7', '(': 'S+Digit8', ')': 'S+Digit9', '=': 'S+Digit0',
-      "'": 'Minus', '?': 'S+Minus', '\u00a1': 'Equal', '\u00bf': 'S+Equal',
-      '`': 'BracketLeft Space', '^': 'S+BracketLeft Space', '[': 'G+BracketLeft',
-      '+': 'BracketRight', '*': 'S+BracketRight', ']': 'G+BracketRight',
-      '\u00f1': 'Semicolon', '\u00d1': 'S+Semicolon',
-      '\u00b4': 'Quote Space', '\u00a8': 'S+Quote Space', '{': 'G+Quote',
-      '\u00e7': 'Backslash', '\u00c7': 'S+Backslash', '}': 'G+Backslash',
-      '<': 'IntlBackslash', '>': 'S+IntlBackslash',
-      ',': 'Comma', ';': 'S+Comma', '.': 'Period', ':': 'S+Period', '-': 'Slash', '_': 'S+Slash'
-    })
-  };
-  deadVowels(LAYOUTS['es-ES'], 'Quote', '\u00e1\u00e9\u00ed\u00f3\u00fa\u00c1\u00c9\u00cd\u00d3\u00da');
-  deadVowels(LAYOUTS['es-ES'], 'BracketLeft', '\u00e0\u00e8\u00ec\u00f2\u00f9\u00c0\u00c8\u00cc\u00d2\u00d9');
-  deadVowels(LAYOUTS['es-ES'], 'S+BracketLeft', '\u00e2\u00ea\u00ee\u00f4\u00fb\u00c2\u00ca\u00ce\u00d4\u00db');
-  deadVowels(LAYOUTS['es-ES'], 'S+Quote', '\u00e4\u00eb\u00ef\u00f6\u00fc\u00c4\u00cb\u00cf\u00d6\u00dc');
 
   // Phone keyboards autocorrect to typographic quotes.
   var SMART_PUNCTUATION = { '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"' };
@@ -601,12 +581,7 @@
     });
   }
 
-  function installTouchKeyboard(layout) {
-    var table = LAYOUTS[layout];
-    if (!table) {
-      console.warn('nanokvm-bridge: unknown KEYBOARD_LAYOUT ' + layout + ', using en-US');
-      table = LAYOUTS['en-US'];
-    }
+  function installTouchKeyboard(layout, table) {
     var sticky = {};
 
     function takeSticky() {
@@ -732,8 +707,16 @@
     if (!window.matchMedia('(pointer: coarse)').matches) return;
     fetch('/api/status', { cache: 'no-store' })
       .then(function (res) { return res.json(); })
-      .then(function (status) { installTouchKeyboard(status.keyboard.layout); })
-      .catch(function () { installTouchKeyboard('en-US'); });
+      .then(function (status) { return status.keyboard.layout; })
+      .catch(function () { return 'en-US'; })
+      .then(function (name) {
+        return loadLayout(name).catch(function (e) {
+          console.warn('nanokvm-bridge: no keyboard layout ' + name + ', using en-US', e);
+          name = 'en-US';
+          return loadLayout(name);
+        }).then(function (layout) { installTouchKeyboard(name, buildTable(layout)); });
+      })
+      .catch(function (e) { console.warn('nanokvm-bridge: touch keyboard unavailable', e); });
   }
 
   // Install

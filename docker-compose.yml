@@ -28,7 +28,7 @@ services:
       AUDIO: "off"
       # AUTH_USER: admin
       # AUTH_PASSWORD: change-me
-      # Target keyboard layout for the phone keyboard: en-US (default) or es-ES.
+      # Target keyboard layout for the phone keyboard, one of web/layouts/ (default en-US).
       # Codes are language-COUNTRY: https://en.wikipedia.org/wiki/IETF_language_tag
       # KEYBOARD_LAYOUT: "en-US"
 

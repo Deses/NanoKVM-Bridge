@@ -17,6 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - run: python3 dev/check_layouts.py
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
