@@ -6,6 +6,7 @@ import base64
 import collections
 import glob
 import hmac
+import json
 import logging
 import math
 import os
@@ -40,7 +41,6 @@ AUDIO_CHANNELS = 2
 AUTH_USER = os.environ.get("AUTH_USER", "")
 AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
 AUTH_ENABLED = bool(AUTH_USER and AUTH_PASSWORD)
-KEYBOARD_LAYOUT = os.environ.get("KEYBOARD_LAYOUT", "en-US").strip()
 
 
 # Re-resolved on every (re)connect, so a replugged dongle is found again.
@@ -384,6 +384,7 @@ TASKS = web.AppKey("tasks", list)
 # Open /stream responses per page (the shim sends a random id), so one
 # viewer can't change the resolution under another.
 VIEWERS = web.AppKey("viewers", collections.Counter)
+LAYOUTS = web.AppKey("layouts", dict)
 
 
 def _credentials_match(header):
@@ -509,7 +510,7 @@ async def api_status(request):
         "serial": request.app[SERIAL].status(),
         "video": request.app[STREAMER].status(),
         "audio": request.app[AUDIO].status(),
-        "keyboard": {"layout": KEYBOARD_LAYOUT},
+        "keyboard": {"layout": read_layout(request.app[LAYOUTS]), "layouts": request.app[LAYOUTS]},
     })
 
 
@@ -528,6 +529,45 @@ async def api_video(request):
         return web.json_response({"ok": True, "applied": False, "resolution": f"{streamer.width}x{streamer.height}"})
     await streamer.set_resolution(width, height)
     return web.json_response({"ok": True, "applied": True, "resolution": f"{width}x{height}"})
+
+
+def available_layouts():
+    layouts = {}
+    for path in sorted(glob.glob(os.path.join(LAYOUTS_DIR, "*.json"))):
+        with open(path, encoding="utf-8") as f:
+            layouts[os.path.basename(path)[:-len(".json")]] = json.load(f)["name"]
+    return layouts
+
+
+def layout_file():
+    return os.path.join(updater.DATA_DIR, "keyboard-layout")
+
+
+# The target's keyboard layout, for the phone keyboard. Chosen from the page,
+# kept in the /data volume.
+def read_layout(layouts):
+    try:
+        with open(layout_file(), encoding="utf-8") as f:
+            name = f.read().strip()
+    except OSError:
+        return "en-US"
+    return name if name in layouts else "en-US"
+
+
+async def api_keyboard(request):
+    try:
+        body = await request.json()
+        name = body["layout"]
+    except (ValueError, KeyError, TypeError):
+        raise web.HTTPBadRequest(text='expected JSON {"layout": "xx-XX"}')
+    if name not in request.app[LAYOUTS]:
+        raise web.HTTPBadRequest(text="unknown layout")
+    tmp = layout_file() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(name)
+    os.replace(tmp, layout_file())
+    LOG.info("keyboard layout set to %s", name)
+    return web.json_response({"ok": True, "layout": name})
 
 
 async def api_version(request):
@@ -582,6 +622,7 @@ def create_app():
     app[STREAMER] = Streamer()
     app[UPDATER] = updater.Updater()
     app[VIEWERS] = collections.Counter()
+    app[LAYOUTS] = available_layouts()
 
     # Static route last: it matches every path.
     app.router.add_get("/", index_handler)
@@ -593,6 +634,7 @@ def create_app():
     app.router.add_post("/api/video", api_video)
     app.router.add_get("/api/version", api_version)
     app.router.add_post("/api/update", api_update)
+    app.router.add_post("/api/keyboard", api_keyboard)
     app.router.add_static("/layouts", LAYOUTS_DIR)
     app.router.add_static("/", updater.WWW_DIR)
 
@@ -605,8 +647,6 @@ def create_app():
 
 def main():
     updater.install_baked()
-    if not os.path.isfile(os.path.join(LAYOUTS_DIR, KEYBOARD_LAYOUT + ".json")):
-        LOG.warning("no layout file for KEYBOARD_LAYOUT %r; the phone keyboard uses en-US", KEYBOARD_LAYOUT)
     LOG.info("audio %s, auth %s",
              "on" if AUDIO_ENABLED else "off",
              f"on (user {AUTH_USER!r})" if AUTH_ENABLED else "off")

@@ -52,7 +52,6 @@ Environment variables in `docker-compose.yml`:
 | `AUTH_USER`, `AUTH_PASSWORD` | | Require HTTP Basic auth for everything when both are set. |
 | `UPDATE_CHECK` | `on` | `off` to stop checking for new NanoKVM-USB releases. |
 | `UPDATE_CHECK_INTERVAL` | `21600` | Seconds between update checks (minimum 60). |
-| `KEYBOARD_LAYOUT` | `en-US` | Keyboard layout of the target machine, used by the phone keyboard (see below). One of the [supported layouts](web/layouts/README.md), as a [language-COUNTRY code](https://en.wikipedia.org/wiki/IETF_language_tag). |
 
 Build args, under `build.args`:
 
@@ -93,10 +92,10 @@ The app then offers the dongle's audio next to its video. If it picks the wrong 
 
 ### Phones and tablets
 
-On a touch screen there's no way to open the phone's keyboard over a video, so a keyboard button appears in the bottom right corner. It opens the phone's own keyboard plus a bar with the keys phones lack: Esc, Tab, Ctrl, Alt, Win, arrows, Del and Ctrl+Alt+Del.
-Ctrl, Alt and Win stay pressed until the next key, so Ctrl then C sends Ctrl+C.
+On a touch screen there's no way to open the phone's keyboard over a video, so a keyboard button appears in the bottom right corner. It opens the phone's own keyboard plus a bar with the keys phones lack: Esc, Tab, Ctrl, Alt, Win, arrows and Del.
+Ctrl, Alt and Win stay pressed until the next key, so Ctrl then C sends Ctrl+C, and Ctrl, Alt, Del sends Ctrl+Alt+Del.
 
-A USB keyboard sends key positions, not characters, and the target turns them into characters with its own layout. So set `KEYBOARD_LAYOUT` to the target's layout, or characters like `ñ` and `@` will come out wrong. Supported layouts are English (US and UK), Spanish (Spain and Latin America), Portuguese (Brazil and Portugal), French, German, Italian and Russian; see [web/layouts](web/layouts/README.md) for their codes and for how to add one. Characters the layout doesn't have are skipped.
+A USB keyboard sends key positions, not characters, and the target turns them into characters with its own layout. So pick the target's layout with the layout button in the bar (it shows the current one, `en-US` at first), or characters like `ñ` and `@` will come out wrong. What matters is the keyboard layout set on the target's operating system, not the phone's keyboard language or the target's locale. The choice is saved on the bridge, so every phone uses it. Supported layouts are English (US and UK), Spanish (Spain and Latin America), Portuguese (Brazil and Portugal), French, German, Italian and Russian; see [web/layouts](web/layouts/README.md) for their codes and for how to add one. Characters the layout doesn't have are skipped.
 
 ## Updating the NanoKVM-USB frontend
 

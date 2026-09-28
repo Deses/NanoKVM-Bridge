@@ -2,7 +2,7 @@
 
 The phone keyboard turns each character you type into key presses on the target. A USB keyboard sends key positions, not characters, so the bridge needs to know which keys the target's layout uses for each character. That's what these files are.
 
-`KEYBOARD_LAYOUT` in `docker-compose.yml` picks one by file name. Unknown names fall back to `en-US`.
+The layout button in the phone keyboard's bar picks one; the choice is saved on the bridge.
 
 | File | Layout |
 | --- | --- |

@@ -584,8 +584,16 @@
     });
   }
 
-  function installTouchKeyboard(layout, table) {
+  function fetchKeyboard() {
+    return fetch('/api/status', { cache: 'no-store' })
+      .then(function (res) { return res.json(); })
+      .then(function (status) { return status.keyboard; });
+  }
+
+  // keyboard: { layout, layouts: { code: name } } from /api/status.
+  function installTouchKeyboard(keyboard) {
     var sticky = {};
+    var current = { name: null, table: {} };
 
     function takeSticky() {
       var held = Object.keys(sticky).filter(function (code) { return sticky[code].on; });
@@ -596,9 +604,9 @@
     function typeText(text) {
       Array.from(text).forEach(function (ch) {
         ch = SMART_PUNCTUATION[ch] || ch;
-        var strokes = table[ch];
+        var strokes = current.table[ch];
         if (!strokes) {
-          console.warn('nanokvm-bridge: no key for ' + JSON.stringify(ch) + ' in ' + layout);
+          console.warn('nanokvm-bridge: no key for ' + JSON.stringify(ch) + ' in ' + current.name);
           return;
         }
         var held = takeSticky();
@@ -670,7 +678,57 @@
     [['\u2190', 'ArrowLeft'], ['\u2191', 'ArrowUp'], ['\u2193', 'ArrowDown'], ['\u2192', 'ArrowRight'], ['Del', 'Delete']].forEach(function (k) {
       barButton(k[0], function () { tap(k[1], takeSticky()); });
     });
-    barButton('Ctrl+Alt+Del', function () { takeSticky(); tap('Delete', ['ControlLeft', 'AltLeft']); });
+
+    // The layout picker: a transparent native select over a label, so the phone
+    // shows its own picker. The choice is saved on the bridge for every viewer.
+    var picker = styled('div', [
+      'position:relative', 'flex:1 0 auto', 'min-width:40px', 'height:36px', 'background:#333', 'color:#f0f0f0',
+      'border:1px solid #555', 'border-radius:4px', 'font-size:14px', 'display:flex', 'align-items:center',
+      'justify-content:center', 'box-sizing:border-box'
+    ]);
+    var pickerLabel = styled('span', []);
+    var select = styled('select', [
+      'position:absolute', 'left:0', 'top:0', 'width:100%', 'height:100%', 'opacity:0', 'font-size:16px'
+    ]);
+    select.setAttribute('aria-label', 'Keyboard layout');
+    Object.keys(keyboard.layouts).forEach(function (code) {
+      var option = document.createElement('option');
+      option.value = code;
+      option.textContent = keyboard.layouts[code] + ' (' + code + ')';
+      select.appendChild(option);
+    });
+    picker.appendChild(pickerLabel);
+    picker.appendChild(select);
+    bar.appendChild(picker);
+
+    function useLayout(name) {
+      return loadLayout(name).catch(function (e) {
+        console.warn('nanokvm-bridge: no keyboard layout ' + name + ', using en-US', e);
+        name = 'en-US';
+        return loadLayout(name);
+      }).then(function (layout) {
+        current.name = name;
+        current.table = buildTable(layout);
+        select.value = name;
+        pickerLabel.textContent = name;
+      });
+    }
+
+    select.addEventListener('change', function () {
+      var name = select.value;
+      fetch('/api/keyboard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ layout: name })
+      }).then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return useLayout(name);
+      }).catch(function (e) {
+        console.warn('nanokvm-bridge: could not change the keyboard layout', e);
+        select.value = current.name;
+      }).then(function () { input.focus({ preventScroll: true }); });
+    });
+
     barButton('\u00d7', function () { input.blur(); });
 
     var open = styled('button', [
@@ -708,16 +766,28 @@
       bar.style.display = 'flex';
       open.style.display = 'none';
       place();
+      // Another viewer may have changed the layout since this page loaded.
+      fetchKeyboard().then(function (k) {
+        if (k.layout !== current.name) useLayout(k.layout);
+      }).catch(function () {});
     });
-    input.addEventListener('blur', function () {
-      bar.style.display = 'none';
-      open.style.display = '';
-      takeSticky();
-      place();
-    });
+
+    // The bar stays up while its layout picker has the focus.
+    function hideUnlessFocused() {
+      setTimeout(function () {
+        if (document.activeElement === input || document.activeElement === select) return;
+        bar.style.display = 'none';
+        open.style.display = '';
+        takeSticky();
+        place();
+      }, 0);
+    }
+    input.addEventListener('blur', hideUnlessFocused);
+    select.addEventListener('blur', hideUnlessFocused);
 
     [input, bar, open].forEach(function (el) { document.body.appendChild(el); });
     place();
+    useLayout(keyboard.layout);
   }
 
   // The app gives the video a 640x360 minimum, which overflows a phone held upright.
@@ -736,17 +806,8 @@
   function setUpTouchKeyboard() {
     // Phones and tablets only: a touch laptop also has a mouse and a real keyboard.
     if (!window.matchMedia('(pointer: coarse) and (hover: none)').matches) return;
-    fetch('/api/status', { cache: 'no-store' })
-      .then(function (res) { return res.json(); })
-      .then(function (status) { return status.keyboard.layout; })
-      .catch(function () { return 'en-US'; })
-      .then(function (name) {
-        return loadLayout(name).catch(function (e) {
-          console.warn('nanokvm-bridge: no keyboard layout ' + name + ', using en-US', e);
-          name = 'en-US';
-          return loadLayout(name);
-        }).then(function (layout) { installTouchKeyboard(name, buildTable(layout)); });
-      })
+    fetchKeyboard()
+      .then(installTouchKeyboard)
       .catch(function (e) { console.warn('nanokvm-bridge: touch keyboard unavailable', e); });
   }
 
