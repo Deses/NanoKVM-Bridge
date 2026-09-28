@@ -28,6 +28,9 @@ services:
       AUDIO: "off"
       # AUTH_USER: admin
       # AUTH_PASSWORD: change-me
+      # Target keyboard layout for the phone keyboard: en-US (default) or es-ES.
+      # Codes are language-COUNTRY: https://en.wikipedia.org/wiki/IETF_language_tag
+      # KEYBOARD_LAYOUT: "en-US"
 
 volumes:
   nanokvm_data:

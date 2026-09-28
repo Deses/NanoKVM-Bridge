@@ -524,6 +524,218 @@
     onDomChange();
   }
 
+  // Touch keyboard: a phone can't open its keyboard over a video, so a button
+  // focuses a hidden textarea and what's typed there is replayed as key presses.
+
+  // Strokes are space-separated; "S+" holds Shift and "G+" holds AltGr.
+  function keyTable(extra) {
+    var table = { ' ': 'Space', '\n': 'Enter', '\t': 'Tab' };
+    for (var i = 0; i < 26; i++) {
+      var letter = String.fromCharCode(97 + i);
+      table[letter] = 'Key' + letter.toUpperCase();
+      table[letter.toUpperCase()] = 'S+Key' + letter.toUpperCase();
+    }
+    for (var d = 0; d < 10; d++) table[String(d)] = 'Digit' + d;
+    Object.keys(extra).forEach(function (ch) { table[ch] = extra[ch]; });
+    return table;
+  }
+
+  function deadVowels(table, deadStroke, accented) {
+    var vowels = 'aeiouAEIOU';
+    for (var i = 0; i < vowels.length; i++) {
+      table[accented[i]] = deadStroke + ' ' + (i >= 5 ? 'S+' : '') + 'Key' + vowels[i].toUpperCase();
+    }
+  }
+
+  var LAYOUTS = {
+    'en-US': keyTable({
+      '`': 'Backquote', '~': 'S+Backquote', '!': 'S+Digit1', '@': 'S+Digit2', '#': 'S+Digit3',
+      '$': 'S+Digit4', '%': 'S+Digit5', '^': 'S+Digit6', '&': 'S+Digit7', '*': 'S+Digit8',
+      '(': 'S+Digit9', ')': 'S+Digit0', '-': 'Minus', '_': 'S+Minus', '=': 'Equal', '+': 'S+Equal',
+      '[': 'BracketLeft', '{': 'S+BracketLeft', ']': 'BracketRight', '}': 'S+BracketRight',
+      '\\': 'Backslash', '|': 'S+Backslash', ';': 'Semicolon', ':': 'S+Semicolon',
+      "'": 'Quote', '"': 'S+Quote', ',': 'Comma', '<': 'S+Comma', '.': 'Period', '>': 'S+Period',
+      '/': 'Slash', '?': 'S+Slash'
+    }),
+    'es-ES': keyTable({
+      '\u00ba': 'Backquote', '\u00aa': 'S+Backquote', '\\': 'G+Backquote',
+      '!': 'S+Digit1', '|': 'G+Digit1', '"': 'S+Digit2', '@': 'G+Digit2', '\u00b7': 'S+Digit3', '#': 'G+Digit3',
+      '$': 'S+Digit4', '~': 'G+Digit4', '%': 'S+Digit5', '\u20ac': 'G+Digit5', '&': 'S+Digit6', '\u00ac': 'G+Digit6',
+      '/': 'S+Digit7', '(': 'S+Digit8', ')': 'S+Digit9', '=': 'S+Digit0',
+      "'": 'Minus', '?': 'S+Minus', '\u00a1': 'Equal', '\u00bf': 'S+Equal',
+      '`': 'BracketLeft Space', '^': 'S+BracketLeft Space', '[': 'G+BracketLeft',
+      '+': 'BracketRight', '*': 'S+BracketRight', ']': 'G+BracketRight',
+      '\u00f1': 'Semicolon', '\u00d1': 'S+Semicolon',
+      '\u00b4': 'Quote Space', '\u00a8': 'S+Quote Space', '{': 'G+Quote',
+      '\u00e7': 'Backslash', '\u00c7': 'S+Backslash', '}': 'G+Backslash',
+      '<': 'IntlBackslash', '>': 'S+IntlBackslash',
+      ',': 'Comma', ';': 'S+Comma', '.': 'Period', ':': 'S+Period', '-': 'Slash', '_': 'S+Slash'
+    })
+  };
+  deadVowels(LAYOUTS['es-ES'], 'Quote', '\u00e1\u00e9\u00ed\u00f3\u00fa\u00c1\u00c9\u00cd\u00d3\u00da');
+  deadVowels(LAYOUTS['es-ES'], 'BracketLeft', '\u00e0\u00e8\u00ec\u00f2\u00f9\u00c0\u00c8\u00cc\u00d2\u00d9');
+  deadVowels(LAYOUTS['es-ES'], 'S+BracketLeft', '\u00e2\u00ea\u00ee\u00f4\u00fb\u00c2\u00ca\u00ce\u00d4\u00db');
+  deadVowels(LAYOUTS['es-ES'], 'S+Quote', '\u00e4\u00eb\u00ef\u00f6\u00fc\u00c4\u00cb\u00cf\u00d6\u00dc');
+
+  // Phone keyboards autocorrect to typographic quotes.
+  var SMART_PUNCTUATION = { '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"' };
+
+  // The app reads only event.code from document key events, so these reach the dongle like real keys.
+  function sendKey(type, code) {
+    document.dispatchEvent(new KeyboardEvent(type, { code: code, bubbles: true, cancelable: true }));
+  }
+
+  var typing = Promise.resolve();
+
+  function tap(stroke, held) {
+    var parts = stroke.split('+');
+    var code = parts.pop();
+    var mods = held.concat(parts.map(function (p) { return p === 'S' ? 'ShiftLeft' : 'AltRight'; }));
+    typing = typing.then(async function () {
+      mods.forEach(function (m) { sendKey('keydown', m); });
+      sendKey('keydown', code);
+      await sleep(20);
+      sendKey('keyup', code);
+      mods.slice().reverse().forEach(function (m) { sendKey('keyup', m); });
+      await sleep(20);
+    });
+  }
+
+  function installTouchKeyboard(layout) {
+    var table = LAYOUTS[layout];
+    if (!table) {
+      console.warn('nanokvm-bridge: unknown KEYBOARD_LAYOUT ' + layout + ', using en-US');
+      table = LAYOUTS['en-US'];
+    }
+    var sticky = {};
+
+    function takeSticky() {
+      var held = Object.keys(sticky).filter(function (code) { return sticky[code].on; });
+      held.forEach(function (code) { sticky[code].on = false; sticky[code].button.style.background = '#333'; });
+      return held;
+    }
+
+    function typeText(text) {
+      Array.from(text).forEach(function (ch) {
+        ch = SMART_PUNCTUATION[ch] || ch;
+        var strokes = table[ch];
+        if (!strokes) {
+          console.warn('nanokvm-bridge: no key for ' + JSON.stringify(ch) + ' in ' + layout);
+          return;
+        }
+        var held = takeSticky();
+        strokes.split(' ').forEach(function (stroke) { tap(stroke, held); });
+      });
+    }
+
+    // One character stays in the textarea so Backspace always has something to delete.
+    var SENTINEL = ' ';
+    var input = styled('textarea', [
+      'position:fixed', 'left:0', 'bottom:0', 'width:1px', 'height:1px', 'opacity:0',
+      'font-size:16px', 'border:0', 'padding:0', 'resize:none'
+    ]);
+    ['autocomplete', 'autocorrect', 'autocapitalize'].forEach(function (a) { input.setAttribute(a, 'off'); });
+    input.spellcheck = false;
+    var last = SENTINEL;
+    var composing = false;
+
+    function reset() {
+      input.value = last = SENTINEL;
+      input.setSelectionRange(1, 1);
+    }
+
+    // Keep the app from handling the textarea's own key and composition events.
+    ['keydown', 'keyup', 'keypress', 'compositionstart', 'compositionupdate', 'compositionend'].forEach(function (type) {
+      input.addEventListener(type, function (e) { e.stopPropagation(); });
+    });
+    input.addEventListener('compositionstart', function () { composing = true; });
+    input.addEventListener('compositionend', function () { composing = false; });
+    input.addEventListener('input', function () {
+      var now = input.value;
+      var same = 0;
+      while (same < last.length && same < now.length && last[same] === now[same]) same++;
+      for (var n = last.length - same; n > 0; n--) tap('Backspace', takeSticky());
+      typeText(now.slice(same));
+      last = now;
+      if (!composing && (now.length === 0 || now.length > 64)) reset();
+    });
+
+    var bar = styled('div', [
+      'position:fixed', 'left:0', 'right:0', 'bottom:0', 'z-index:2147483646', 'display:none',
+      'flex-wrap:wrap', 'gap:4px', 'padding:4px', 'background:#1f1f1f', 'border-top:1px solid #434343'
+    ]);
+
+    function barButton(label, onPress) {
+      var button = styled('button', [
+        'flex:1 0 auto', 'min-width:40px', 'height:36px', 'background:#333', 'color:#f0f0f0',
+        'border:1px solid #555', 'border-radius:4px', 'font-size:14px', 'padding:0 6px'
+      ], label);
+      // Keep the focus (and the phone's keyboard) on the textarea.
+      button.addEventListener('pointerdown', function (e) { e.preventDefault(); });
+      button.addEventListener('click', onPress);
+      bar.appendChild(button);
+      return button;
+    }
+
+    [['Esc', 'Escape'], ['Tab', 'Tab']].forEach(function (k) {
+      barButton(k[0], function () { tap(k[1], takeSticky()); });
+    });
+    [['Ctrl', 'ControlLeft'], ['Alt', 'AltLeft'], ['Win', 'MetaLeft']].forEach(function (k) {
+      var entry = { on: false };
+      entry.button = barButton(k[0], function () {
+        entry.on = !entry.on;
+        entry.button.style.background = entry.on ? '#1668dc' : '#333';
+      });
+      sticky[k[1]] = entry;
+    });
+    [['\u2190', 'ArrowLeft'], ['\u2191', 'ArrowUp'], ['\u2193', 'ArrowDown'], ['\u2192', 'ArrowRight'], ['Del', 'Delete']].forEach(function (k) {
+      barButton(k[0], function () { tap(k[1], takeSticky()); });
+    });
+    barButton('Ctrl+Alt+Del', function () { takeSticky(); tap('Delete', ['ControlLeft', 'AltLeft']); });
+    barButton('\u00d7', function () { input.blur(); });
+
+    var open = styled('button', [
+      'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483646', 'width:48px', 'height:48px',
+      'border-radius:24px', 'background:#1668dc', 'color:#fff', 'border:none', 'font-size:22px',
+      'box-shadow:0 2px 8px rgba(0,0,0,0.5)'
+    ], '\u2328');
+    open.setAttribute('aria-label', 'Keyboard');
+    open.addEventListener('click', function () {
+      reset();
+      input.focus();
+    });
+
+    // Sit on top of the phone's keyboard, which shrinks the visual viewport.
+    function placeBar() {
+      var vv = window.visualViewport;
+      bar.style.bottom = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) + 'px' : '0';
+    }
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', placeBar);
+      window.visualViewport.addEventListener('scroll', placeBar);
+    }
+    input.addEventListener('focus', function () {
+      bar.style.display = 'flex';
+      open.style.display = 'none';
+      placeBar();
+    });
+    input.addEventListener('blur', function () {
+      bar.style.display = 'none';
+      open.style.display = '';
+      takeSticky();
+    });
+
+    [input, bar, open].forEach(function (el) { document.body.appendChild(el); });
+  }
+
+  function setUpTouchKeyboard() {
+    if (!window.matchMedia('(pointer: coarse)').matches) return;
+    fetch('/api/status', { cache: 'no-store' })
+      .then(function (res) { return res.json(); })
+      .then(function (status) { installTouchKeyboard(status.keyboard.layout); })
+      .catch(function () { installTouchKeyboard('en-US'); });
+  }
+
   // Install
 
   function override(name, value) {
@@ -536,6 +748,7 @@
 
   window.addEventListener('DOMContentLoaded', function () {
     if (new URLSearchParams(location.search).get('autoconnect') !== '0') installAutoConnect();
+    setUpTouchKeyboard();
     // Let the app connect to the device before asking about updates.
     setTimeout(checkForUpdate, 1000);
   });

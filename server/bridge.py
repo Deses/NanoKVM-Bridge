@@ -38,6 +38,7 @@ AUDIO_CHANNELS = 2
 AUTH_USER = os.environ.get("AUTH_USER", "")
 AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
 AUTH_ENABLED = bool(AUTH_USER and AUTH_PASSWORD)
+KEYBOARD_LAYOUT = os.environ.get("KEYBOARD_LAYOUT", "en-US").strip()
 
 
 # Re-resolved on every (re)connect, so a replugged dongle is found again.
@@ -497,6 +498,7 @@ async def api_status(request):
         "serial": request.app[SERIAL].status(),
         "video": request.app[STREAMER].status(),
         "audio": request.app[AUDIO].status(),
+        "keyboard": {"layout": KEYBOARD_LAYOUT},
     })
 
 
