@@ -11,6 +11,9 @@
   var RETRY_MS = 500;
   var MAX_STREAM_BUFFER = 8 * 1024 * 1024;
   var CRLF2 = new Uint8Array([13, 10, 13, 10]);
+  // Identifies this page to the bridge, which only lets a page change the
+  // resolution when no other page is watching.
+  var CLIENT_ID = Math.random().toString(36).slice(2);
 
   function wsUrl(path) {
     return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + path;
@@ -163,7 +166,7 @@
   async function pumpMjpeg(video) {
     while (!video.stopped) {
       try {
-        var res = await fetch('/stream', { signal: video.abort.signal, cache: 'no-store' });
+        var res = await fetch('/stream?client=' + CLIENT_ID, { signal: video.abort.signal, cache: 'no-store' });
         if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
         var boundaryMatch = /boundary="?([^;"]+)"?/i.exec(res.headers.get('content-type') || '');
         var boundary = new TextEncoder().encode('--' + (boundaryMatch ? boundaryMatch[1] : 'boundarydonotcross'));
@@ -311,7 +314,7 @@
       await fetch('/api/video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ width: width, height: height })
+        body: JSON.stringify({ width: width, height: height, client: CLIENT_ID })
       });
     } catch (e) {
       console.warn('nanokvm-bridge: could not set the capture resolution', e);
@@ -606,7 +609,7 @@
     // One character stays in the textarea so Backspace always has something to delete.
     var SENTINEL = ' ';
     var input = styled('textarea', [
-      'position:fixed', 'left:0', 'bottom:0', 'width:1px', 'height:1px', 'opacity:0',
+      'position:fixed', 'left:0', 'top:0', 'width:1px', 'height:1px', 'opacity:0',
       'font-size:16px', 'border:0', 'padding:0', 'resize:none'
     ]);
     ['autocomplete', 'autocorrect', 'autocapitalize'].forEach(function (a) { input.setAttribute(a, 'off'); });
@@ -677,7 +680,7 @@
     open.setAttribute('aria-label', 'Keyboard');
     open.addEventListener('click', function () {
       reset();
-      input.focus();
+      input.focus({ preventScroll: true });
     });
 
     // Sit on top of the phone's keyboard, which shrinks the visual viewport.
@@ -703,8 +706,19 @@
     [input, bar, open].forEach(function (el) { document.body.appendChild(el); });
   }
 
+  // The app gives the video a 640x360 minimum, which overflows a phone held upright.
+  function fitSmallScreens() {
+    var style = document.createElement('style');
+    style.textContent = '@media (max-width: 639px), (max-height: 359px) { #video { min-width: 0 !important; min-height: 0 !important; } }';
+    document.head.appendChild(style);
+    // Shrink the page above the phone's keyboard instead of letting it cover the video.
+    var meta = document.querySelector('meta[name="viewport"]');
+    if (meta && meta.content.indexOf('interactive-widget') === -1) meta.content += ', interactive-widget=resizes-content';
+  }
+
   function setUpTouchKeyboard() {
-    if (!window.matchMedia('(pointer: coarse)').matches) return;
+    // Phones and tablets only: a touch laptop also has a mouse and a real keyboard.
+    if (!window.matchMedia('(pointer: coarse) and (hover: none)').matches) return;
     fetch('/api/status', { cache: 'no-store' })
       .then(function (res) { return res.json(); })
       .then(function (status) { return status.keyboard.layout; })
@@ -731,6 +745,7 @@
 
   window.addEventListener('DOMContentLoaded', function () {
     if (new URLSearchParams(location.search).get('autoconnect') !== '0') installAutoConnect();
+    fitSmallScreens();
     setUpTouchKeyboard();
     // Let the app connect to the device before asking about updates.
     setTimeout(checkForUpdate, 1000);

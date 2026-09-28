@@ -65,6 +65,8 @@ Build args, under `build.args`:
 Auto-detection picks the first entry in `/dev/serial/by-id/` and the first `*-video-index0` entry in `/dev/v4l/by-id/`, and falls back to `/dev/ttyACM0`, `/dev/ttyUSB0` and `/dev/video0`. If the host has other USB serial or video devices attached, set the device variables explicitly.
 A dongle plugged in after the container starts is picked up automatically.
 
+Several people can watch at once, but there's only one video stream. The first viewer's resolution wins: a resolution change from another page is ignored until that page is the only one watching.
+
 To see what the bridge found:
 
 ```bash

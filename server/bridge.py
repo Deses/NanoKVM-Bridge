@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import collections
 import glob
 import hmac
 import logging
@@ -380,6 +381,9 @@ STREAMER = web.AppKey("streamer", Streamer)
 UPDATER = web.AppKey("updater", updater.Updater)
 HTTP_CLIENT = web.AppKey("http_client", aiohttp.ClientSession)
 TASKS = web.AppKey("tasks", list)
+# Open /stream responses per page (the shim sends a random id), so one
+# viewer can't change the resolution under another.
+VIEWERS = web.AppKey("viewers", collections.Counter)
 
 
 def _credentials_match(header):
@@ -441,6 +445,9 @@ async def stream_handler(request):
     except aiohttp.ClientError as exc:
         raise web.HTTPServiceUnavailable(text=f"video stream unavailable: {exc}")
 
+    viewers = request.app[VIEWERS]
+    client = request.query.get("client", "")
+    viewers[client] += 1
     try:
         response = web.StreamResponse(
             status=upstream.status,
@@ -453,6 +460,9 @@ async def stream_handler(request):
         pass  # viewer left or ustreamer restarted; the shim reconnects
     finally:
         upstream.close()
+        viewers[client] -= 1
+        if viewers[client] <= 0:
+            del viewers[client]
     return response
 
 
@@ -511,8 +521,13 @@ async def api_video(request):
         raise web.HTTPBadRequest(text='expected JSON {"width": int, "height": int}')
     if not valid_resolution(width, height):
         raise web.HTTPBadRequest(text="resolution out of range")
-    await request.app[STREAMER].set_resolution(width, height)
-    return web.json_response({"ok": True})
+    streamer = request.app[STREAMER]
+    client = body.get("client") or ""
+    if any(viewer != client for viewer in request.app[VIEWERS]):
+        LOG.info("ignoring %dx%d: another viewer is watching at %dx%d", width, height, streamer.width, streamer.height)
+        return web.json_response({"ok": True, "applied": False, "resolution": f"{streamer.width}x{streamer.height}"})
+    await streamer.set_resolution(width, height)
+    return web.json_response({"ok": True, "applied": True, "resolution": f"{width}x{height}"})
 
 
 async def api_version(request):
@@ -566,6 +581,7 @@ def create_app():
     app[AUDIO] = AudioBridge()
     app[STREAMER] = Streamer()
     app[UPDATER] = updater.Updater()
+    app[VIEWERS] = collections.Counter()
 
     # Static route last: it matches every path.
     app.router.add_get("/", index_handler)
