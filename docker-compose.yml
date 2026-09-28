@@ -1,12 +1,12 @@
 services:
-  nanokvm-pi:
+  nanokvm-bridge:
     build:
       context: .
       args:
         NANOKVM_USB_VERSION: "1.1.4"
         WITH_AUDIO: "false"
     image: ghcr.io/deses/nanokvm-bridge:latest
-    container_name: nanokvm-pi
+    container_name: nanokvm-bridge
     restart: unless-stopped
 
     ports:

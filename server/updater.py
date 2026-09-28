@@ -17,13 +17,13 @@ import urllib.error
 import urllib.request
 import zipfile
 
-LOG = logging.getLogger("nanokvm-pi.updater")
+LOG = logging.getLogger("nanokvm-bridge.updater")
 
 BAKED_DIR = "/www-image"
 DATA_DIR = "/data"
 WWW_DIR = os.path.join(DATA_DIR, "www")
 VERSION_FILE = ".nanokvm-usb-version"
-SHIM_TAG = '<script src="/nanokvm-pi-shim.js"></script>'
+SHIM_TAG = '<script src="/nanokvm-bridge-shim.js"></script>'
 
 # Overridable to point at a mirror or a local stand-in for testing.
 RELEASES_API_URL = os.environ.get(
@@ -35,7 +35,7 @@ DOWNLOAD_URL_TEMPLATE = os.environ.get(
     "https://github.com/sipeed/NanoKVM-USB/releases/download/"
     "v{version}/nanokvm-usb-browser-v{version}.zip",
 )
-REQUEST_HEADERS = {"User-Agent": "nanokvm-pi"}
+REQUEST_HEADERS = {"User-Agent": "nanokvm-bridge"}
 
 CHECK_ENABLED = os.environ.get("UPDATE_CHECK", "on").strip().lower() not in ("0", "off", "false", "no")
 CHECK_INTERVAL = max(60, int(os.environ.get("UPDATE_CHECK_INTERVAL", str(6 * 3600))))
@@ -73,7 +73,7 @@ def install_baked():
 
     baked = read_version(BAKED_DIR)
     installed = parse_version(installed_version())
-    if os.path.isfile(os.path.join(WWW_DIR, "index.html")) and installed and installed >= parse_version(baked):
+    if _loads_shim(os.path.join(WWW_DIR, "index.html")) and installed and installed >= parse_version(baked):
         return
 
     LOG.info("installing NanoKVM-USB frontend v%s", baked)
@@ -82,6 +82,14 @@ def install_baked():
         shutil.copytree(BAKED_DIR, new_dir)
         _prepare(new_dir, baked)
         _swap_in(new_dir)
+
+
+def _loads_shim(index_path):
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            return SHIM_TAG in f.read()
+    except OSError:
+        return False
 
 
 def _clean_up_interrupted_install():

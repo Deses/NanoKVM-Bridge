@@ -4,10 +4,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMAGE=${IMAGE:-nanokvm-pi:e2e}
+IMAGE=${IMAGE:-nanokvm-bridge:e2e}
 PORT=${PORT:-47899}
 GITHUB_PORT=9998
-NAME=nanokvm-pi-e2e
+NAME=nanokvm-bridge-e2e
 WORK=$(mktemp -d)
 
 cleanup() {

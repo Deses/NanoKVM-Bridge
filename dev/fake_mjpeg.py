@@ -18,7 +18,7 @@ def make_frame(width, height, counter):
     draw.rectangle([0, 0, width - 1, height - 1], outline=(80, 200, 120), width=4)
     draw.text(
         (20, 20),
-        f"NanoKVM-Pi fake frame #{counter}\n{time.strftime('%H:%M:%S')}",
+        f"NanoKVM-Bridge fake frame #{counter}\n{time.strftime('%H:%M:%S')}",
         fill=(230, 230, 230),
     )
     buf = io.BytesIO()

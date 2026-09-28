@@ -3,9 +3,9 @@
 (function () {
   'use strict';
 
-  var VIDEO_DEVICE_ID = 'nanokvm-pi-video';
-  var AUDIO_DEVICE_ID = 'nanokvm-pi-audio';
-  var DEVICE_GROUP_ID = 'nanokvm-pi';
+  var VIDEO_DEVICE_ID = 'nanokvm-bridge-video';
+  var AUDIO_DEVICE_ID = 'nanokvm-bridge-audio';
+  var DEVICE_GROUP_ID = 'nanokvm-bridge';
   var AUDIO_SAMPLE_RATE = 48000;
   var AUDIO_CHANNELS = 2;
   var RETRY_MS = 500;
@@ -187,7 +187,7 @@
         }
       } catch (err) {
         if (video.stopped) return;
-        console.warn('nanokvm-pi: video stream interrupted, retrying', err);
+        console.warn('nanokvm-bridge: video stream interrupted, retrying', err);
       }
       if (!video.stopped) await sleep(RETRY_MS);
     }
@@ -286,13 +286,13 @@
 
   async function enumerateDevices() {
     var devices = [
-      { deviceId: VIDEO_DEVICE_ID, groupId: DEVICE_GROUP_ID, kind: 'videoinput', label: 'NanoKVM-USB via Pi' }
+      { deviceId: VIDEO_DEVICE_ID, groupId: DEVICE_GROUP_ID, kind: 'videoinput', label: 'NanoKVM-USB (network)' }
     ];
     try {
       var res = await fetch('/api/status', { cache: 'no-store' });
       var status = res.ok ? await res.json() : null;
       if (status && status.audio.enabled) {
-        devices.push({ deviceId: AUDIO_DEVICE_ID, groupId: DEVICE_GROUP_ID, kind: 'audioinput', label: 'NanoKVM-USB via Pi (audio)' });
+        devices.push({ deviceId: AUDIO_DEVICE_ID, groupId: DEVICE_GROUP_ID, kind: 'audioinput', label: 'NanoKVM-USB (network audio)' });
       }
     } catch (e) { /* bridge unreachable - offer video only */ }
     return devices;
@@ -314,7 +314,7 @@
         body: JSON.stringify({ width: width, height: height })
       });
     } catch (e) {
-      console.warn('nanokvm-pi: could not set the capture resolution', e);
+      console.warn('nanokvm-bridge: could not set the capture resolution', e);
     }
 
     // Only muted media may autoplay before a gesture, and the app relies on autoplay.
@@ -326,7 +326,7 @@
       try {
         stream.addTrack(await createAudioTrack());
       } catch (e) {
-        console.warn('nanokvm-pi: audio unavailable, continuing with video only', e);
+        console.warn('nanokvm-bridge: audio unavailable, continuing with video only', e);
       }
     }
     return stream;
@@ -363,7 +363,7 @@
   }
 
   function dismissKey(version) {
-    return 'nanokvm-pi-update-dismissed-' + version;
+    return 'nanokvm-bridge-update-dismissed-' + version;
   }
 
   function showUpdateBanner(info) {
@@ -504,7 +504,7 @@
         await pickOnlyVideoDevice(dialog);
         await clickSerialButton(dialog);
       } catch (e) {
-        console.warn('nanokvm-pi: auto-connect failed; connect manually', e);
+        console.warn('nanokvm-bridge: auto-connect failed; connect manually', e);
       } finally {
         running = false;
       }

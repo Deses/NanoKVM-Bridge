@@ -69,8 +69,8 @@ def main():
 
     # --- HTTP surface
     status, _, body = http_get(url + "/")
-    check("index served with shim tag", status == 200 and b"/nanokvm-pi-shim.js" in body)
-    _, headers, _ = http_get(url + "/nanokvm-pi-shim.js")
+    check("index served with shim tag", status == 200 and b"/nanokvm-bridge-shim.js" in body)
+    _, headers, _ = http_get(url + "/nanokvm-bridge-shim.js")
     check("shim sent no-cache", headers.get("Cache-Control") == "no-cache")
     try:
         http_get(url + "/.nanokvm-usb-version")

@@ -21,12 +21,12 @@ from aiohttp import WSMsgType, web
 import updater
 
 logging.basicConfig(level=logging.INFO, format="[bridge] %(message)s")
-LOG = logging.getLogger("nanokvm-pi")
+LOG = logging.getLogger("nanokvm-bridge")
 
 HTTP_PORT = 80
 STREAM_PORT = 8081
-SHIM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nanokvm-pi-shim.js")
-NO_CACHE_PATHS = {"/", "/index.html", "/nanokvm-pi-shim.js"}
+SHIM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nanokvm-bridge-shim.js")
+NO_CACHE_PATHS = {"/", "/index.html", "/nanokvm-bridge-shim.js"}
 
 SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "57600"))
 VIDEO_RESOLUTION = os.environ.get("VIDEO_RESOLUTION", "1920x1080")
@@ -399,7 +399,7 @@ async def auth_middleware(request, handler):
         return await handler(request)
     return web.Response(
         status=401,
-        headers={"WWW-Authenticate": 'Basic realm="NanoKVM-Pi"'},
+        headers={"WWW-Authenticate": 'Basic realm="NanoKVM-Bridge"'},
         text="Unauthorized",
     )
 
@@ -566,7 +566,7 @@ def create_app():
 
     # Static route last: it matches every path.
     app.router.add_get("/", index_handler)
-    app.router.add_get("/nanokvm-pi-shim.js", shim_handler)
+    app.router.add_get("/nanokvm-bridge-shim.js", shim_handler)
     app.router.add_get("/stream", stream_handler)
     app.router.add_get("/ws/serial", ws_serial_handler)
     app.router.add_get("/ws/audio", ws_audio_handler)

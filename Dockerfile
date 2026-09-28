@@ -37,7 +37,7 @@ RUN apk add --no-cache libbsd libevent libjpeg-turbo python3 py3-aiohttp py3-pys
 COPY --from=ustreamer /out/ustreamer /usr/local/bin/ustreamer
 # Installed into the /data volume on startup; see updater.install_baked().
 COPY --from=frontend /www /www-image
-COPY server/bridge.py server/updater.py web/nanokvm-pi-shim.js dev/fake_mjpeg.py /app/
+COPY server/bridge.py server/updater.py web/nanokvm-bridge-shim.js dev/fake_mjpeg.py /app/
 
 EXPOSE 80
 
