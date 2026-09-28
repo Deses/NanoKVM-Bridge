@@ -462,20 +462,29 @@
     return null;
   }
 
+  // Keeps trying while the dialog is up: after a restart or replug the select
+  // and its device list can take a few seconds to appear.
   async function pickOnlyVideoDevice(dialog) {
-    var select = dialog.querySelector('.ant-select');
-    if (!select || select.querySelector('.ant-select-selection-item')) return; // none, or already chosen
-    var selector = select.querySelector('.ant-select-selector');
-    var toggle = function () { selector.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); };
-    toggle();
-    var options = await waitFor(function () {
-      var found = document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option');
-      return found.length ? found : null;
-    }, 2000);
-    if (options && options.length === 1) {
-      options[0].click();
-    } else {
-      toggle(); // several (or no) devices: close the list and leave it to the user
+    var deadline = Date.now() + 15000;
+    while (Date.now() < deadline && isShown(dialog)) {
+      var select = dialog.querySelector('.ant-select');
+      if (select && select.querySelector('.ant-select-selection-item')) return;
+      if (select) {
+        var selector = select.querySelector('.ant-select-selector');
+        var toggle = function () { selector.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); };
+        toggle();
+        var options = await waitFor(function () {
+          var found = document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option');
+          return found.length ? found : null;
+        }, 1500);
+        if (options && options.length === 1) {
+          options[0].click();
+          return;
+        }
+        toggle();
+        if (options) return; // several devices: leave it to the user
+      }
+      await sleep(1000);
     }
   }
 
