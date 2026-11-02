@@ -26,12 +26,13 @@ RUN wget -q -O /tmp/browser.zip \
     && unzip -q /tmp/browser.zip -d /www \
     && printf '%s' "${NANOKVM_USB_VERSION}" > /www/.nanokvm-usb-version
 
-FROM alpine:${ALPINE_VERSION}
+FROM alpine:${ALPINE_VERSION} AS runtime
 
 # Audio needs alsa-utils; set to true (and AUDIO=on) to enable it.
 ARG WITH_AUDIO=false
 
-RUN apk add --no-cache libbsd libevent libjpeg-turbo python3 py3-aiohttp py3-pyserial \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache libbsd libevent libjpeg-turbo python3 py3-aiohttp py3-pyserial \
     && if [ "$WITH_AUDIO" = "true" ]; then apk add --no-cache alsa-utils; fi
 
 COPY --from=ustreamer /out/ustreamer /usr/local/bin/ustreamer
