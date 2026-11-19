@@ -1,0 +1,61 @@
+name: nightly
+
+# Rebuilds main only when Trivy finds Alpine packages with a fix available in the published
+# :latest images. The runtime stage is never cached, so a rebuild picks those fixes up. Findings
+# in libraries need a code change instead, so they fail the libraries job and never trigger one.
+# GitHub disables scheduled workflows after 60 days without commits; re-enable it in the
+# Actions tab when that happens.
+on:
+  schedule:
+    # UTC: 05:00 in Spain in winter, 06:00 in summer.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/deses/nanokvm-bridge:latest
+  PLATFORMS: linux/amd64 linux/386 linux/arm64 linux/arm/v7
+  TRIVY: docker run --rm -e TRIVY_USERNAME=${{ github.actor }} -e TRIVY_PASSWORD=${{ secrets.GITHUB_TOKEN }} -v trivy-cache:/root/.cache/trivy aquasec/trivy:0.76.2 image --quiet --ignore-unfixed
+
+jobs:
+  packages:
+    runs-on: ubuntu-latest
+    outputs:
+      fixable: ${{ steps.scan.outputs.fixable }}
+    steps:
+      # Exit code 3 means findings; any other failure (registry, database) stops the run.
+      - id: scan
+        shell: sh {0}
+        run: |
+          fixable=false
+          for platform in $PLATFORMS; do
+            $TRIVY --pkg-types os --exit-code 3 --platform "$platform" "$IMAGE"
+            code=$?
+            if [ "$code" = 3 ]; then
+              fixable=true
+            elif [ "$code" != 0 ]; then
+              exit "$code"
+            fi
+          done
+          echo "fixable=$fixable" >> "$GITHUB_OUTPUT"
+
+  libraries:
+    runs-on: ubuntu-latest
+    steps:
+      - run: for platform in $PLATFORMS; do $TRIVY --pkg-types library --exit-code 1 --platform "$platform" "$IMAGE"; done
+
+  build:
+    needs: packages
+    if: needs.packages.outputs.fixable == 'true'
+    uses: ./.github/workflows/image.yml
+
+  # A finding that survives the rebuild has no fix in Alpine yet for this branch; without this
+  # check the nightly would rebuild for it every night without anyone noticing.
+  verify:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - run: for platform in $PLATFORMS; do $TRIVY --pkg-types os --exit-code 1 --platform "$platform" "$IMAGE"; done
