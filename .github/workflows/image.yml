@@ -6,6 +6,8 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  # nightly.yml calls it when the published images have Alpine packages with fixes available.
+  workflow_call:
 
 permissions:
   contents: read
